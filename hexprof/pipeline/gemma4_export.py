@@ -65,6 +65,23 @@ def quantize(checkpoint: str | Path, out_dir: str | Path, num_samples: int = 20,
     return Path(out_dir)
 
 
+def export_argv(options: set[str], checkpoint: str | Path, device_name: str, target_runtime: str | None,
+                precision: str | None, output_dir: str | Path, extra: Sequence[str] = ()) -> list[str]:
+    """Arguments for Qualcomm's export parser, using only the flags it offers.
+
+    LLM recipes with a separate quantize script (Gemma 4) have no ``--precision``:
+    the parser derives it from ``--checkpoint`` (w4a16 for ``DEFAULT``).
+    """
+    argv = ["--checkpoint", str(checkpoint), "--device", device_name, "--output-dir", str(output_dir)]
+    if target_runtime:
+        flag = next((f for f in ("--target-runtime", "--runtime") if f in options), None)
+        if flag:
+            argv += [flag, target_runtime]
+    if precision and "--precision" in options:
+        argv += ["--precision", precision]
+    return argv + list(extra)
+
+
 def run_official_export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
                         target_runtime: str = "geniex_qairt", precision: str = "w4a16",
                         extra: Sequence[str] = ()) -> Any:
@@ -80,11 +97,12 @@ def run_official_export(checkpoint: str | Path, out_dir: str | Path, device_name
 
     out = Path(out_dir)
     source_dir = resolve_recipe_dir(MODEL_ID)
-    argv = ["--checkpoint", str(checkpoint), "--device", device_name, "--target-runtime", target_runtime,
-            "--precision", precision, "--output-dir", str(out / "export_assets"), *extra]
     parser = build_export_parser_for(source_dir)
+    argv = export_argv(set(parser._option_string_actions), checkpoint, device_name, target_runtime, precision,
+                       out / "export_assets", extra)
     args = parser.parse_args(argv)
-    print(f"qai-hub-models export {MODEL_ID} " + " ".join(argv))
+    print(f"qai-hub-models export {MODEL_ID} " + " ".join(argv)
+          + f"  (precision: {getattr(args, 'precision', None)}, runtime: {getattr(args, 'target_runtime', None)})")
     try:  # batch jobs (e.g. Slurm) have no stdin: answer Qualcomm's yes/no prompts with "yes"
         from qai_hub_models.utils.asset_loaders import always_answer_prompts  # type: ignore[import-not-found]
     except ImportError:  # pragma: no cover - older qai_hub_models

@@ -166,3 +166,19 @@ def test_download_dir_routes_every_cache(tmp_path, monkeypatch):
     bundle.mkdir()
     (bundle / "metadata.json").write_text("{}")
     assert cli._bundle(args) == bundle
+
+
+def test_export_argv_matches_qualcomm_parser():
+    # Option strings from the real `qai-hub-models export gemma_4_e4b_it` usage (qai_hub_models 0.65, no --precision).
+    gemma_opts = {"--runtime", "--target-runtime", "--checkpoint", "--host-device", "--no--skip-quantsim-creation",
+                  "--sequence-lengths", "--context-lengths", "--zip-assets", "--inference-options",
+                  "--skip-profiling", "--skip-downloading", "--skip-summary", "--output-dir", "--compile-options",
+                  "--link-options", "--device", "--chipset", "--device-os"}
+    argv = gemma4_export.export_argv(gemma_opts, "DEFAULT", "Samsung Galaxy S25", "geniex_qairt", "w4a16", "out",
+                                     ["--skip-downloading"])
+    assert "--precision" not in argv
+    assert argv == ["--checkpoint", "DEFAULT", "--device", "Samsung Galaxy S25", "--output-dir", "out",
+                    "--target-runtime", "geniex_qairt", "--skip-downloading"]
+    assert set(a for a in argv if a.startswith("--")) <= gemma_opts
+    # recipes that do take --precision still get it
+    assert "--precision" in gemma4_export.export_argv(gemma_opts | {"--precision"}, "c", "d", "r", "w4a16", "o")
