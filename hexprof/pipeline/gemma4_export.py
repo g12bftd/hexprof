@@ -65,10 +65,14 @@ def quantize(checkpoint: str | Path, out_dir: str | Path, num_samples: int = 20,
     return Path(out_dir)
 
 
-def export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
-           target_runtime: str = "geniex_qairt", precision: str = "w4a16", extra: Sequence[str] = (),
-           hw: bool = True) -> dict[str, Any]:
-    """Stage 2: compile + link + profile on AI Hub with the official recipe, then collect metrics."""
+def run_official_export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
+                        target_runtime: str = "geniex_qairt", precision: str = "w4a16",
+                        extra: Sequence[str] = ()) -> Any:
+    """``qai-hub-models export gemma_4_e4b_it`` in-process; returns its export result (with job handles).
+
+    ``checkpoint="DEFAULT"`` uses Qualcomm's published w4a16 checkpoint (an 18.7 GB
+    download into ``$QAIHM_STORE_ROOT/.qaihm``; no GPU needed).
+    """
     _require_qaihm()
     from qai_hub_models.cli.dispatch import build_export_parser_for  # type: ignore[import-not-found]
     from qai_hub_models.utils.export.context import resolve_recipe_dir  # type: ignore[import-not-found]
@@ -81,8 +85,15 @@ def export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Sams
     parser = build_export_parser_for(source_dir)
     args = parser.parse_args(argv)
     print(f"qai-hub-models export {MODEL_ID} " + " ".join(argv))
-    result = select_pipeline(source_dir)(**vars(args))
-    return collect(result, out, hw)
+    return select_pipeline(source_dir)(**vars(args))
+
+
+def export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
+           target_runtime: str = "geniex_qairt", precision: str = "w4a16", extra: Sequence[str] = (),
+           hw: bool = True) -> dict[str, Any]:
+    """Stage 2: compile + link + profile on AI Hub with the official recipe, then collect metrics."""
+    result = run_official_export(checkpoint, out_dir, device_name, target_runtime, precision, extra)
+    return collect(result, Path(out_dir), hw)
 
 
 def collect(result: Any, out_dir: Path, hw: bool = True) -> dict[str, Any]:
@@ -92,11 +103,21 @@ def collect(result: Any, out_dir: Path, hw: bool = True) -> dict[str, Any]:
     rows = []
     md = []
     for key, job in jobs.items():
-        label = "/".join(key) if isinstance(key, tuple) else str(key)
+        component, graph = (key if isinstance(key, tuple) and len(key) == 2 else (str(key), str(key)))
+        label = f"{component}/{graph}"
         stem = label.replace("/", "__")
         prof, _ = hc.save_profile(job, out_dir / "profiles", stem)
         m = aihub_metrics(prof)
-        rec: dict[str, Any] = {"job": hc.job_info(job), "metrics": m}
+        model = getattr(job, "model", None)
+        rec: dict[str, Any] = {
+            "component": component,
+            "graph": graph,
+            "job": hc.job_info(job),
+            # what was profiled, so the same graph can be re-run with real inputs
+            "model_id": getattr(model, "model_id", None),
+            "options": getattr(job, "options", "") or "",
+            "metrics": m,
+        }
         write_json(out_dir / "profiles" / f"{stem}.per_layer.json", per_layer(prof))
         if hw:
             rec["hw_artifacts"] = hc.download_hw_artifacts(job, out_dir / "hw" / stem)

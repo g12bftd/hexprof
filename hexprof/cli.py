@@ -1,12 +1,16 @@
 """hexprof command line.
 
     hexprof doctor
+    hexprof gemma4   aihub                            (AI Hub hosted S25, no phone)
     hexprof gemma4   setup | infer | profile          (GenieX on an adb-connected phone)
     hexprof siglip2  fetch | infer | profile          (AI Hub hosted Galaxy S25)
     hexprof hub      profile | metrics                (any model / existing job)
     hexprof hw       fields | classify                (optrace / QHAS)
     hexprof ceilings compute | bandwidth | kv-check   (NPU ceilings via AI Hub)
     hexprof pipeline gemma4 quantize | export         (fine-tuned Gemma 4 -> S25)
+
+Global option (any position): --download-dir DIR puts every download under DIR
+(AI Hub Models assets, Hugging Face files, llama.cpp models, geniex-bench).
 """
 
 from __future__ import annotations
@@ -24,6 +28,41 @@ from hexprof.devices import GALAXY_S25
 from hexprof.io_utils import run_dir
 
 DEFAULT_HUB_DEVICE = GALAXY_S25.hub_name
+
+
+def apply_download_dir(path: str | None) -> Path | None:
+    """Point every downloader at ``path`` (must run before those packages are imported)."""
+    path = path or os.environ.get("HEXPROF_DOWNLOAD_DIR")
+    if not path:
+        return None
+    d = Path(path).expanduser().resolve()
+    d.mkdir(parents=True, exist_ok=True)
+    os.environ["HEXPROF_DOWNLOAD_DIR"] = str(d)
+    os.environ["QAIHM_STORE_ROOT"] = str(d)  # AI Hub Models cache -> <d>/.qaihm (Gemma 4 checkpoint)
+    os.environ["HF_HUB_CACHE"] = str(d / "huggingface")  # processors, tokenizers, configs
+    os.environ["LLAMA_CACHE"] = str(d / "llama.cpp")  # llama-mtmd-cli -hf downloads
+    os.environ["HEXPROF_CACHE"] = str(d / "hexprof")  # geniex-bench packages
+    return d
+
+
+def _pop_download_dir(argv: list[str]) -> tuple[str | None, list[str]]:
+    out, value, i = [], None, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--download-dir" and i + 1 < len(argv):
+            value, i = argv[i + 1], i + 2
+            continue
+        if a.startswith("--download-dir="):
+            value = a.split("=", 1)[1]
+        else:
+            out.append(a)
+        i += 1
+    return value, out
+
+
+def _assets_dir() -> Path:
+    d = os.environ.get("HEXPROF_DOWNLOAD_DIR")
+    return Path(d) if d else Path("assets")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -146,13 +185,32 @@ def cmd_gemma4_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gemma4_aihub(args: argparse.Namespace) -> int:
+    from hexprof.models import gemma4_aihub
+
+    export_dir = Path(args.export_dir) if args.export_dir else gemma4_aihub.default_export_dir()
+    if args.export_only:
+        gemma4_aihub.ensure_export(export_dir, args.device, args.checkpoint, hw=not args.no_hw, force=args.force_export)
+        return 0
+    if args.force_export:
+        gemma4_aihub.ensure_export(export_dir, args.device, args.checkpoint, hw=not args.no_hw, force=True)
+    images = _expand_images(args.image)
+    if not images:
+        raise SystemExit("give at least one --image (file or folder)")
+    gemma4_aihub.infer(images, _read_prompts(args), run_dir(args.out, "gemma4-aihub"), device_name=args.device,
+                       export_dir=export_dir, checkpoint=args.checkpoint, hw=not args.no_hw,
+                       max_new_tokens=args.max_new_tokens, local=args.local_answer, llama_cli=args.llama_cli,
+                       gguf=args.gguf, mmproj=args.mmproj, hf_repo=args.hf_repo)
+    return 0
+
+
 # --------------------------------------------------------------------------- siglip2
 
 
 def cmd_siglip2_fetch(args: argparse.Namespace) -> int:
     from hexprof.models import siglip2
 
-    path = siglip2.fetch(args.out, args.precision, args.runtime)
+    path = siglip2.fetch(args.out or _assets_dir(), args.precision, args.runtime)
     print(f"SigLIP 2 bundle: {path}")
     return 0
 
@@ -160,7 +218,7 @@ def cmd_siglip2_fetch(args: argparse.Namespace) -> int:
 def _bundle(args: argparse.Namespace) -> Path:
     from hexprof.models import siglip2
 
-    b = Path(args.bundle)
+    b = Path(args.bundle) if args.bundle else _assets_dir() / f"siglip2-qnn_dlc-{args.precision}"
     if not (b / "metadata.json").exists():
         print(f"{b} has no SigLIP 2 bundle yet; fetching the AI Hub Models asset ({args.precision}, qnn_dlc)...")
         b = siglip2.fetch(b.parent if b.name.startswith("siglip2-") else b, args.precision, "qnn_dlc")
@@ -381,6 +439,8 @@ def cmd_pipeline_export(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hexprof", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"hexprof {__version__}")
+    ap.add_argument("--download-dir", help="put all downloads under this folder (also: env HEXPROF_DOWNLOAD_DIR); "
+                                           "accepted anywhere on the command line")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("doctor", help="check AI Hub token, adb, phone and geniex-bench")
@@ -388,7 +448,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_doctor)
 
     # ---- gemma4
-    g = sub.add_parser("gemma4", help="Gemma 4 E4B through GenieX on an adb-connected phone").add_subparsers(dest="sub", required=True)
+    g = sub.add_parser("gemma4", help="Gemma 4 E4B: on AI Hub (aihub) or through GenieX on a USB phone").add_subparsers(dest="sub", required=True)
+    p = g.add_parser("aihub", help="your image + prompt on AI Hub's hosted S25 (no phone): vision encoder run on "
+                                   "your image, per-stage timing from the compiled graphs, answer via local llama.cpp")
+    p.add_argument("--image", action="append", help="image file or folder (repeatable)")
+    p.add_argument("--prompt", action="append", help="question / instruction (repeatable)")
+    p.add_argument("--prompts-file", help="text file, one prompt per blank-line-separated paragraph")
+    p.add_argument("--device", default=DEFAULT_HUB_DEVICE, help="AI Hub device name")
+    p.add_argument("--export-dir", help="where the one-time compile/profile results live "
+                                        "(default: <download-dir>/gemma4-s25-export or runs/gemma4-s25-export)")
+    p.add_argument("--export-only", action="store_true", help="only run the one-time compile + profile step")
+    p.add_argument("--force-export", action="store_true", help="redo the compile + profile step")
+    p.add_argument("--checkpoint", default="DEFAULT", help="DEFAULT = Qualcomm's published w4a16 checkpoint, "
+                                                           "or a quantized checkpoint dir from `pipeline gemma4 quantize`")
+    p.add_argument("--max-new-tokens", type=int, default=256,
+                   help="answer length cap; also M for the decode estimate when no local answer is generated")
+    p.add_argument("--local-answer", choices=["auto", "on", "off"], default="auto",
+                   help="generate the answer text with llama.cpp on this computer (auto = if llama-mtmd-cli is installed)")
+    p.add_argument("--llama-cli", help="path to llama-mtmd-cli")
+    p.add_argument("--gguf", default="google/gemma-4-E4B-it-qat-q4_0-gguf:Q4_0",
+                   help="Hugging Face repo[:quant] or local .gguf for the local answer (default: what GenieX runs)")
+    p.add_argument("--mmproj", help="vision projector .gguf (only if the GGUF repo has none)")
+    p.add_argument("--hf-repo", default="google/gemma-4-E4B-it", help="processor/tokenizer used for token counts")
+    p.add_argument("--no-hw", action="store_true", help="skip optrace / QHAS download")
+    p.add_argument("--out", help="output dir (default runs/gemma4-aihub-<time>)")
+    p.set_defaults(func=cmd_gemma4_aihub)
+
     p = g.add_parser("setup", help="install geniex-bench on the phone and pull the model there")
     _add_phone_args(p)
     _add_gemma_model_args(p)
@@ -436,12 +521,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = s.add_parser("fetch", help="download AI Hub Models' pre-built SigLIP 2 bundle")
     p.add_argument("--precision", default="w8a16", choices=["w8a16", "float"])
     p.add_argument("--runtime", default="qnn_dlc", choices=["qnn_dlc", "onnx", "tflite"])
-    p.add_argument("--out", default="assets")
+    p.add_argument("--out", help="target folder (default: --download-dir, else ./assets)")
     p.set_defaults(func=cmd_siglip2_fetch)
     for name, fn, helptext in [("infer", cmd_siglip2_infer, "embed your images (and score labels) on the S25"),
                                ("profile", cmd_siglip2_profile, "AI Hub profile job, same as AI Hub's published numbers")]:
         p = s.add_parser(name, help=helptext)
-        p.add_argument("--bundle", default="assets/siglip2-qnn_dlc-w8a16", help="folder from `hexprof siglip2 fetch`")
+        p.add_argument("--bundle", help="folder from `hexprof siglip2 fetch` (default: <download-dir or ./assets>/"
+                                        "siglip2-qnn_dlc-<precision>; fetched automatically if missing)")
         p.add_argument("--precision", default="w8a16", choices=["w8a16", "float"], help="used when the bundle is fetched")
         p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
         p.add_argument("--qairt-version", help="AI Hub QAIRT version (default: the one the asset was verified with; 'default' = AI Hub's)")
@@ -551,7 +637,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    download_dir, rest = _pop_download_dir(list(sys.argv[1:] if argv is None else argv))
+    d = apply_download_dir(download_dir)
+    if d is not None:
+        print(f"Downloads go to {d}")
+    args = build_parser().parse_args(rest)
     if hasattr(args, "extra") and args.extra and args.extra[0] == "--":
         args.extra = args.extra[1:]
     try:
@@ -559,6 +649,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted (AI Hub jobs keep running; re-run with the same --out to resume)", file=sys.stderr)
         return 130
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        if os.environ.get("HEXPROF_DEBUG"):
+            raise
+        print(f"error: {e}\n(set HEXPROF_DEBUG=1 for the full traceback)", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

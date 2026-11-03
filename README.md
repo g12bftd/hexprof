@@ -8,7 +8,7 @@ The package implements the plan in *"Gemma 4 on the Galaxy S25: results, hardwar
 
 | Plan section | Command |
 |---|---|
-| Results: Gemma 4 VQA end to end = vision encoder + prefill (N tokens) + decode (M tokens) | `hexprof gemma4 infer` |
+| Results: Gemma 4 VQA end to end = vision encoder + prefill (N tokens) + decode (M tokens) | `hexprof gemma4 infer` (phone), `hexprof gemma4 aihub` (no phone) |
 | Results: SigLIP 2 image encoder, W8A16, AI Hub's own asset | `hexprof siglip2 infer` / `profile` |
 | AI Hub-consistent metrics | `hexprof gemma4 profile`, `hexprof hub metrics` |
 | Compute ceiling: `latency = t0 + ops / P` per precision | `hexprof ceilings compute` |
@@ -32,6 +32,43 @@ The package implements the plan in *"Gemma 4 on the Galaxy S25: results, hardwar
   Models (`siglip2-base-patch16-224`), executed on AI Hub's hosted Galaxy S25 (QNN HTP = NPU). No
   phone is needed for this path. AI Hub's published figure for it is **3.319 ms**
   (job `jpx0kk1jp`), the 3.32 ms quoted in the plan.
+
+## No phone? Everything on AI Hub's hosted Galaxy S25
+
+You only need an AI Hub account. Gemma 4 and SigLIP 2 then both run on AI Hub's hosted S25 with
+**your own image and prompt**:
+
+| | Gemma 4 E4B (`hexprof gemma4 aihub`) | SigLIP 2 (`hexprof siglip2 infer`) |
+|---|---|---|
+| Runs on the S25 | vision encoder on your image (real job) + every compiled text graph profiled | image encoder on your image (real job) |
+| Model | Qualcomm's w4a16 compiled QNN graphs (their official export) | Qualcomm's W8A16 QAIRT DLC |
+| You get | per-stage time on the S25 for your input: vision encoder, prefill of your N tokens, decode per token, TTFT, end to end; AI Hub metrics for every graph | embeddings, image similarity, zero-shot label scores, AI Hub metrics |
+| Answer text | generated on your computer by llama.cpp with the same Q4_0 GGUF GenieX runs on the S25 (optional) | n/a |
+
+Why Gemma 4 cannot answer *on* AI Hub: Workbench runs one compiled graph per job with no state between
+jobs, and Gemma 4 needs its 4 text parts chained with the KV cache for every generated token (4 cloud
+jobs per token). So Workbench measures every graph, and your image and prompt decide how many 128-token
+prefill chunks are needed. The text-graph timings do not depend on content; only the token count does.
+
+The first `gemma4 aihub` run (or `--export-only`) compiles Gemma 4 with Qualcomm's recipe and profiles
+each graph on the S25. That step downloads Qualcomm's published w4a16 checkpoint (18.7 GB), needs
+about 32 GB of RAM (Linux or WSL2 recommended; no GPU) and can take a few hours. Every later run reuses
+it and only submits one vision-encoder job per image.
+
+## Where downloads go
+
+Add `--download-dir /path/to/dir` to any command (or `export HEXPROF_DOWNLOAD_DIR=/path/to/dir`):
+
+| What | Location |
+|---|---|
+| SigLIP 2 model bundle | `<dir>/siglip2-qnn_dlc-w8a16/` |
+| Gemma 4 checkpoint and AI Hub Models cache | `<dir>/.qaihm/` |
+| Gemma 4 compile/profile results (reused) | `<dir>/gemma4-s25-export/` |
+| Hugging Face files (processors, tokenizers) | `<dir>/huggingface/` |
+| llama.cpp model for the local answer | `<dir>/llama.cpp/` |
+| geniex-bench packages (phone path) | `<dir>/hexprof/` |
+
+Results always go to `--out` (default `runs/<command>-<time>/`).
 
 ## Install
 
@@ -60,6 +97,27 @@ your Hugging Face access needs one; it is forwarded to the phone and never logge
 ```bash
 hexprof doctor
 ```
+
+## Gemma 4 on AI Hub (no phone)
+
+```bash
+pip install -e '.[pipeline]'
+```
+
+```bash
+qai-hub-models install gemma_4_e4b_it
+```
+
+```bash
+hexprof gemma4 aihub --download-dir ~/hexprof-data --image photo.jpg --prompt "What is in this picture?"
+```
+
+* Prompts: repeat `--prompt`, or use `--prompts-file`. Images: repeat `--image`, or pass a folder.
+* The answer text needs `llama-mtmd-cli` from llama.cpp (macOS: `brew install llama.cpp`; others:
+  github.com/ggml-org/llama.cpp/releases). Without it you still get the S25 timings; decode is then
+  estimated for `--max-new-tokens` tokens. `--local-answer off` skips it.
+* Output in `runs/gemma4-aihub-<time>/`: `results.md` with the answer and the stage table, `results.json`,
+  and the vision encoder's output embeddings as `.npy`.
 
 ## Gemma 4 on the S25 (GenieX, NPU)
 

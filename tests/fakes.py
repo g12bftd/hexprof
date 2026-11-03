@@ -145,6 +145,8 @@ class FakeJob:
     outputs: dict | None = None
     target: FakeModel | None = None
     fail: bool = False
+    model: FakeModel | None = None
+    options: str = ""
 
     @property
     def url(self) -> str:
@@ -221,7 +223,9 @@ class FakeHub:
                   options: str = "") -> FakeJob:
             self.calls.append(("inference", name, options))
             outputs = self.output_fn(model, inputs) if (self.output_fn and inputs is not None) else None
-            return self._job(profile=fake_profile(self.latency_fn(model.payload, inputs)), outputs=outputs)
+            self.last_inputs = inputs
+            return self._job(profile=fake_profile(self.latency_fn(model.payload, inputs)), outputs=outputs,
+                             model=model, options=options)
 
         monkeypatch.setattr(hc, "submit_quantize", quantize)
         monkeypatch.setattr(hc, "submit_compile", compile_)
