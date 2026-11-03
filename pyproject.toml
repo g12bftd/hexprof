@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hexprof"
+version = "0.1.0"
+description = "Run, profile and bound VLM workloads (Gemma 4, SigLIP 2) on the Snapdragon Hexagon NPU of the Galaxy S25 via Qualcomm AI Hub and GenieX."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "BSD-3-Clause" }
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6",
+    "pillow>=10",
+    "onnx>=1.16,<1.19",
+    "qai-hub>=0.56",
+]
+
+[project.optional-dependencies]
+# `qai-hub-models fetch` for the pre-built SigLIP 2 / Gemma 4 assets (lightweight CLI).
+assets = ["qai_hub_models_cli>=0.65"]
+# Zero-shot labels for SigLIP 2 (tokenizer + logit scale/bias from Hugging Face).
+siglip-text = ["transformers>=4.50", "huggingface_hub>=0.34", "safetensors>=0.4"]
+# Plots for the ceiling fits.
+plots = ["matplotlib>=3.7"]
+# Local numerical checks of the synthetic ceiling graphs.
+check = ["onnxruntime>=1.19"]
+# Fine-tuned Gemma 4 pipeline (Qualcomm's own export recipe; GPU needed for calibration).
+# Afterwards run `qai-hub-models install gemma_4_e4b_it` to pull the recipe's pinned deps.
+pipeline = ["qai-hub-models>=0.65"]
+dev = ["pytest>=8", "onnxruntime>=1.19", "matplotlib>=3.7"]
+
+[project.scripts]
+hexprof = "hexprof.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hexprof*"]
+
+[tool.setuptools.package-data]
+hexprof = ["reference/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,565 @@
+"""hexprof command line.
+
+    hexprof doctor
+    hexprof gemma4   setup | infer | profile          (GenieX on an adb-connected phone)
+    hexprof siglip2  fetch | infer | profile          (AI Hub hosted Galaxy S25)
+    hexprof hub      profile | metrics                (any model / existing job)
+    hexprof hw       fields | classify                (optrace / QHAS)
+    hexprof ceilings compute | bandwidth | kv-check   (NPU ceilings via AI Hub)
+    hexprof pipeline gemma4 quantize | export         (fine-tuned Gemma 4 -> S25)
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any, Sequence
+
+from hexprof import __version__
+from hexprof.devices import GALAXY_S25
+from hexprof.io_utils import run_dir
+
+DEFAULT_HUB_DEVICE = GALAXY_S25.hub_name
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _phone(args: argparse.Namespace):  # noqa: ANN202
+    from hexprof.geniex.adb import Adb
+    from hexprof.geniex.bench import GenieXPhone
+
+    return GenieXPhone(Adb(serial=args.serial, dry_run=args.dry_run, verbose=args.verbose))
+
+
+def _read_prompts(args: argparse.Namespace) -> list[str]:
+    prompts = list(args.prompt or [])
+    if args.prompts_file:
+        text = Path(args.prompts_file).read_text(encoding="utf-8")
+        # one prompt per paragraph (blank-line separated) so prompts can span lines
+        prompts += [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
+    if not prompts:
+        raise SystemExit("give at least one --prompt or --prompts-file")
+    return prompts
+
+
+def _expand_images(items: Sequence[str] | None) -> list[str]:
+    out: list[str] = []
+    for item in items or []:
+        p = Path(item)
+        if p.is_dir():
+            out += sorted(str(f) for f in p.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"})
+        else:
+            out.append(item)
+    return out
+
+
+def _add_phone_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--serial", help="adb serial of the phone (if several are connected)")
+    p.add_argument("--dry-run", action="store_true", help="print the adb/geniex-bench commands without running them")
+    p.add_argument("-v", "--verbose", action="store_true", help="echo every adb command")
+
+
+def _add_gemma_model_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--plugin", choices=["llama_cpp", "qairt"], default="llama_cpp",
+                   help="GenieX backend: llama_cpp = AI Hub's published Gemma 4 path (Q4_0 GGUF); "
+                        "qairt = compiled QNN bundle (w4a16)")
+    p.add_argument("--model", help="model-manager id, local .gguf, or local GenieX QAIRT bundle dir "
+                                   "(default: AI Hub's id for the plugin)")
+    p.add_argument("--mmproj", help="vision projector .gguf for llama_cpp (default: from the model manager)")
+
+
+# --------------------------------------------------------------------------- doctor
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    ok = True
+
+    def line(name: str, good: bool, detail: str, optional: bool = False) -> None:
+        nonlocal ok
+        ok &= good or optional
+        print(f"[{'ok' if good else ('--' if optional else '!!')}] {name}: {detail}")
+
+    for mod, why, optional in [("qai_hub", "AI Hub jobs", False), ("onnx", "ceiling graphs", False),
+                               ("qai_hub_models_cli", "fetch AI Hub assets", True),
+                               ("transformers", "SigLIP 2 zero-shot labels / Gemma 4 dims", True),
+                               ("matplotlib", "plots", True)]:
+        found = importlib.util.find_spec(mod) is not None
+        line(mod, found, ("installed" if found else "not installed (optional)" if optional else "missing") + f" ({why})",
+             optional)
+    cfg = Path(os.environ.get("QAIHUB_CLIENT_INI", Path.home() / ".qai_hub" / "client.ini"))
+    line("AI Hub token", cfg.exists(), str(cfg) if cfg.exists() else "run `qai-hub configure --api_token <TOKEN>`")
+    adb = shutil.which("adb")
+    line("adb", adb is not None, adb or "install Android platform-tools (only needed for Gemma 4 / GenieX)", optional=True)
+    if adb:
+        phone = _phone(args)
+        try:
+            devs = phone.adb.devices()
+            line("phone", bool(devs), ", ".join(devs) or "no device; enable USB debugging and accept the prompt")
+            if devs:
+                info = phone.check_device()
+                line("SoC", info["soc_model"] == GALAXY_S25.soc_model, f"{info['model']} / {info['soc_model']} / Android {info['android']}")
+                v = phone.installed_version()
+                line("geniex-bench on phone", v is not None, v or "run `hexprof gemma4 setup`")
+        except Exception as e:  # noqa: BLE001
+            line("phone", False, str(e))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- gemma4
+
+
+def cmd_gemma4_setup(args: argparse.Namespace) -> int:
+    from hexprof.models import gemma4
+
+    res = gemma4.setup(_phone(args), args.geniex_version, args.plugin, args.model, args.mmproj,
+                       pull=not args.no_pull, vlm=not args.text_only, refresh=args.refresh)
+    for k, v in res.items():
+        print(f"{k}: {v}")
+    return 0
+
+
+def cmd_gemma4_infer(args: argparse.Namespace) -> int:
+    from hexprof.models import gemma4
+
+    cfg = gemma4.InferConfig(
+        plugin=args.plugin, compute=args.compute, model=args.model, mmproj=args.mmproj,
+        max_new_tokens=args.max_new_tokens, context_length=args.context_length, repeats=args.repeats,
+        warmup=args.warmup, system_prompt=args.system_prompt, think=args.think, temperature=args.temperature,
+        seed=args.seed, power_mode=args.power_mode, max_gen_time_s=args.max_gen_time_s,
+        images_together=args.images_together,
+    )
+    gemma4.infer(_phone(args), cfg, _expand_images(args.image), _read_prompts(args), run_dir(args.out, "gemma4-infer"))
+    return 0
+
+
+def cmd_gemma4_profile(args: argparse.Namespace) -> int:
+    from hexprof.models import gemma4
+
+    gemma4.profile_aihub(_phone(args), run_dir(args.out, "gemma4-profile"), plugin=args.plugin, model=args.model,
+                         computes=args.compute, contexts=args.contexts, repetitions=args.repetitions,
+                         n_gen=args.n_gen, power_mode=args.power_mode, qairt_lib=args.qairt_lib)
+    return 0
+
+
+# --------------------------------------------------------------------------- siglip2
+
+
+def cmd_siglip2_fetch(args: argparse.Namespace) -> int:
+    from hexprof.models import siglip2
+
+    path = siglip2.fetch(args.out, args.precision, args.runtime)
+    print(f"SigLIP 2 bundle: {path}")
+    return 0
+
+
+def _bundle(args: argparse.Namespace) -> Path:
+    from hexprof.models import siglip2
+
+    b = Path(args.bundle)
+    if not (b / "metadata.json").exists():
+        print(f"{b} has no SigLIP 2 bundle yet; fetching the AI Hub Models asset ({args.precision}, qnn_dlc)...")
+        b = siglip2.fetch(b.parent if b.name.startswith("siglip2-") else b, args.precision, "qnn_dlc")
+    return b
+
+
+def cmd_siglip2_infer(args: argparse.Namespace) -> int:
+    from hexprof.models import siglip2
+
+    images = _expand_images(args.image)
+    if not images:
+        raise SystemExit("give at least one --image (file or folder)")
+    siglip2.infer(images, _bundle(args), run_dir(args.out, "siglip2-infer"), labels=args.labels,
+                  device_name=args.device, qairt_version=args.qairt_version, options=args.options, hw=not args.no_hw,
+                  logit_scale=args.logit_scale, logit_bias=args.logit_bias)
+    return 0
+
+
+def cmd_siglip2_profile(args: argparse.Namespace) -> int:
+    from hexprof.models import siglip2
+
+    siglip2.profile(_bundle(args), run_dir(args.out, "siglip2-profile"), components=args.components,
+                    device_name=args.device, qairt_version=args.qairt_version, options=args.options, hw=not args.no_hw)
+    return 0
+
+
+# --------------------------------------------------------------------------- hub / hw
+
+
+def cmd_hub_profile(args: argparse.Namespace) -> int:
+    from hexprof.aihub import client as hc
+    from hexprof.aihub.metrics import aihub_metrics, metrics_markdown
+
+    out = run_dir(args.out, "hub-profile")
+    model: Any = args.model if Path(args.model).exists() else hc.get_model(args.model)
+    job = hc.submit_inference(model, hc.device(args.device), None, profile=True, name="hexprof profile",
+                              options=args.options)
+    print(f"profile job {job.job_id}: {job.url}")
+    prof, _ = hc.save_profile(job, out, job.job_id)
+    print(metrics_markdown(f"{args.model} on {args.device}", aihub_metrics(prof)))
+    if args.hw:
+        print(hc.download_hw_artifacts(job, out / "hw"))
+    return 0
+
+
+def cmd_hub_metrics(args: argparse.Namespace) -> int:
+    from hexprof.aihub import client as hc
+    from hexprof.aihub.metrics import aihub_metrics, metrics_markdown, op_type_breakdown, per_layer
+    from hexprof.io_utils import markdown_table, write_json
+
+    out = run_dir(args.out, f"job-{args.job_id}")
+    job = hc.get_job(args.job_id)
+    prof, _ = hc.save_profile(job, out, args.job_id)
+    m = aihub_metrics(prof)
+    write_json(out / "metrics.json", {"job": hc.job_info(job), "metrics": m, "per_layer": per_layer(prof)})
+    print(metrics_markdown(f"{args.job_id} ({hc.job_info(job)['device']})", m))
+    ops = op_type_breakdown(prof)[:12]
+    if ops:
+        print(markdown_table(["type", "unit", "count", "time us", "share"],
+                             [[o["type"], o["compute_unit"], o["count"], o["time_us"], o["share"]] for o in ops], 3))
+    if args.hw:
+        print(hc.download_hw_artifacts(job, out / "hw"))
+    return 0
+
+
+def cmd_hw_fields(args: argparse.Namespace) -> int:
+    import json
+
+    from hexprof.aihub import hwtrace
+
+    for f in args.files:
+        print(json.dumps(hwtrace.describe(f), indent=2)[: args.max_chars])
+    return 0
+
+
+def _parse_map(items: Sequence[str] | None) -> dict[str, str]:
+    out = {}
+    for it in items or []:
+        k, _, v = it.partition("=")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_hw_classify(args: argparse.Namespace) -> int:
+    from hexprof.aihub import client as hc
+    from hexprof.aihub import hwtrace
+    from hexprof.aihub.metrics import per_layer
+    from hexprof.ceilings.experiments import load_ceilings
+    from hexprof.io_utils import markdown_table, read_json, write_json
+
+    out = run_dir(args.out, "hw-classify")
+    files = list(args.trace or [])
+    layers: list[dict] = []
+    if args.job:
+        job = hc.get_job(args.job)
+        prof, _ = hc.save_profile(job, out, args.job)
+        layers = per_layer(prof)
+        arts = hc.download_hw_artifacts(job, out)
+        files += [p for k in ("qhas", "optrace") for p in arts.get(k, []) if str(p).endswith(".json")]
+    elif args.profile:
+        layers = per_layer(read_json(args.profile))
+    if not files:
+        raise SystemExit("no optrace / QHAS JSON found (AI Hub only attaches them to NPU profile jobs)")
+    ceil = load_ceilings(args.compute_json, args.bandwidth_json)
+    bw = args.bandwidth_gbps or ceil.get("B_gbps")
+    for f in files:
+        rs = hwtrace.best_record_set(f)
+        if rs is None:
+            print(f"{f}: no per-op table found; inspect with `hexprof hw fields {f}`")
+            continue
+        rows = hwtrace.normalize(rs, _parse_map(args.field_map))
+        hwtrace.merge_aihub_timing(rows, layers)
+        hwtrace.classify(rows, bw, args.util_threshold, args.bw_fraction)
+        summ = hwtrace.class_summary(rows)
+        write_json(out / (Path(f).stem + ".classified.json"), {"source": f, "record_path": rs.path,
+                                                               "fields": hwtrace.match_fields(rs.keys, _parse_map(args.field_map)),
+                                                               "bandwidth_gbps": bw, "summary": summ, "ops": rows})
+        print(f"\n{f} ({rs.path}, {len(rows)} ops, B = {bw} GB/s)")
+        print(markdown_table(["class", "ops", "time us", "share"],
+                             [[k, v["ops"], v["time_us"], v["time_share"]] for k, v in summ.items()], 3))
+        top = sorted(rows, key=lambda r: -(r.get("time_us") or 0))[:15]
+        print(markdown_table(["op", "type", "time us", "HMX", "HVX", "GB/s", "class"],
+                             [[r["name"][:48], r.get("op_type"), r.get("time_us"), r.get("hmx_util"), r.get("hvx_util"),
+                               r.get("achieved_gbps"), r["bound"]] for r in top], 2))
+    return 0
+
+
+# --------------------------------------------------------------------------- ceilings
+
+
+def _sweep(args: argparse.Namespace, prefix: str):  # noqa: ANN202
+    from hexprof.ceilings.runner import Sweep
+
+    return Sweep(run_dir(args.out, prefix), args.device, runtime=args.runtime, compile_options=args.compile_options,
+                 profile_options=args.profile_options, quantize_options=args.quantize_options,
+                 qairt_version=args.qairt_version, quantize_io=not args.no_quantize_io, n_calib=args.calib_samples,
+                 hw=args.hw, dry_run=args.dry_run)
+
+
+def _add_sweep_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--device", default=DEFAULT_HUB_DEVICE, help="AI Hub device name")
+    p.add_argument("--runtime", default="qnn_context_binary", choices=["qnn_context_binary", "qnn_dlc"],
+                   help="AI Hub target runtime (context binary = what GenieX QAIRT loads)")
+    p.add_argument("--qairt-version", help="pin QAIRT on AI Hub (e.g. 2.50)")
+    p.add_argument("--compile-options", default="")
+    p.add_argument("--profile-options", default="", help="e.g. '--max_profiler_iterations 200'")
+    p.add_argument("--quantize-options", default="")
+    p.add_argument("--no-quantize-io", action="store_true", help="keep float graph I/O (default: --quantize_io)")
+    p.add_argument("--calib-samples", type=int, default=4)
+    p.add_argument("--hw", action="store_true", help="also download optrace / QHAS for every point")
+    p.add_argument("--dry-run", action="store_true", help="build and save the graphs only")
+    p.add_argument("--out", help="output dir; re-use it to resume a sweep")
+
+
+def cmd_ceilings_compute(args: argparse.Namespace) -> int:
+    from hexprof.ceilings.experiments import compute_sweep
+
+    compute_sweep(_sweep(args, "ceil-compute"), args.precisions, args.size, args.chain, args.rows)
+    return 0
+
+
+def _dims(args: argparse.Namespace):  # noqa: ANN202
+    from dataclasses import replace
+
+    from hexprof.ceilings import graphs
+
+    dims = graphs.load_gemma4_dims(args.hf_repo) if not args.no_hf_config else graphs.Gemma4Dims()
+    if args.intermediate_size:
+        dims = replace(dims, intermediate=args.intermediate_size, source=dims.source + "+override")
+    return dims
+
+
+def cmd_ceilings_bandwidth(args: argparse.Namespace) -> int:
+    from hexprof.ceilings.experiments import bandwidth_sweep
+
+    bandwidth_sweep(_sweep(args, "ceil-bandwidth"), args.precision, widths=args.widths, width_layers=args.width_layers,
+                    gemma4_layers=args.gemma4_layers, gemma4_dims=_dims(args) if args.gemma4_layers else None,
+                    context=args.context, include_kv=args.include_kv, onchip_mb=args.onchip_mb)
+    return 0
+
+
+def cmd_ceilings_kv(args: argparse.Namespace) -> int:
+    from hexprof.ceilings.experiments import kv_cache_check
+
+    kv_cache_check(run_dir(args.out, "ceil-kv"), args.device, args.precision, args.layers, args.context, _dims(args),
+                   runtime=args.runtime, qairt_version=args.qairt_version, tolerance=args.tolerance)
+    return 0
+
+
+def _add_dims_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--hf-repo", default="google/gemma-4-E4B-it", help="read decoder dims from this HF config")
+    p.add_argument("--no-hf-config", action="store_true", help="use built-in dims without contacting Hugging Face")
+    p.add_argument("--intermediate-size", type=int, help="override the MLP width")
+
+
+# --------------------------------------------------------------------------- pipeline
+
+
+def cmd_pipeline_quantize(args: argparse.Namespace) -> int:
+    from hexprof.pipeline import gemma4_export
+
+    gemma4_export.quantize(args.checkpoint, args.out, args.num_samples, args.context_length, args.sequence_length,
+                           args.export_only, args.extra)
+    return 0
+
+
+def cmd_pipeline_export(args: argparse.Namespace) -> int:
+    from hexprof.pipeline import gemma4_export
+
+    gemma4_export.export(args.checkpoint, run_dir(args.out, "gemma4-export"), args.device, args.target_runtime,
+                         args.precision, args.extra, hw=not args.no_hw)
+    return 0
+
+
+# --------------------------------------------------------------------------- parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="hexprof", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"hexprof {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("doctor", help="check AI Hub token, adb, phone and geniex-bench")
+    _add_phone_args(p)
+    p.set_defaults(func=cmd_doctor)
+
+    # ---- gemma4
+    g = sub.add_parser("gemma4", help="Gemma 4 E4B through GenieX on an adb-connected phone").add_subparsers(dest="sub", required=True)
+    p = g.add_parser("setup", help="install geniex-bench on the phone and pull the model there")
+    _add_phone_args(p)
+    _add_gemma_model_args(p)
+    p.add_argument("--geniex-version", help="pin a geniex-bench release, e.g. 0.10.0 (default: latest stable)")
+    p.add_argument("--no-pull", action="store_true", help="install only; the model downloads on first use")
+    p.add_argument("--text-only", action="store_true", help="do not pull the vision projector")
+    p.add_argument("--refresh", action="store_true", help="re-download and re-push geniex-bench")
+    p.set_defaults(func=cmd_gemma4_setup)
+
+    p = g.add_parser("infer", help="answer prompts about images; prints answers + per-stage latency")
+    _add_phone_args(p)
+    _add_gemma_model_args(p)
+    p.add_argument("--image", action="append", help="image file or folder (repeatable)")
+    p.add_argument("--prompt", action="append", help="question / instruction (repeatable)")
+    p.add_argument("--prompts-file", help="text file, one prompt per blank-line-separated paragraph")
+    p.add_argument("--images-together", action="store_true", help="send all images in one turn instead of one run per image")
+    p.add_argument("--compute", default="npu", choices=["npu", "cpu", "gpu", "hybrid", "auto"])
+    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--context-length", type=int, default=4096)
+    p.add_argument("--repeats", type=int, default=3, help="measured runs per (image, prompt)")
+    p.add_argument("--warmup", type=int, default=1, help="unmeasured runs per (image, prompt)")
+    p.add_argument("--system-prompt")
+    p.add_argument("--think", action="store_true", help="enable Gemma 4 thinking (default off)")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--power-mode", help="HTP power mode, e.g. burst (default) or sustained_high_performance")
+    p.add_argument("--max-gen-time-s", type=int, default=600)
+    p.add_argument("--out", help="output dir (default runs/gemma4-infer-<time>)")
+    p.set_defaults(func=cmd_gemma4_infer)
+
+    p = g.add_parser("profile", help="AI Hub's GenieX llm_metrics sweep (TPS, prefill TPS, TTFT range) vs published")
+    _add_phone_args(p)
+    _add_gemma_model_args(p)
+    p.add_argument("--compute", nargs="+", default=["npu"], choices=["npu", "cpu", "gpu", "hybrid"])
+    p.add_argument("--contexts", nargs="+", type=int, default=[512, 4096])
+    p.add_argument("--repetitions", type=int, default=3)
+    p.add_argument("--n-gen", type=int, default=128)
+    p.add_argument("--power-mode")
+    p.add_argument("--qairt-lib", help="device path of another QAIRT runtime (qairt plugin)")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_gemma4_profile)
+
+    # ---- siglip2
+    s = sub.add_parser("siglip2", help="SigLIP 2 image encoder on an AI Hub hosted S25").add_subparsers(dest="sub", required=True)
+    p = s.add_parser("fetch", help="download AI Hub Models' pre-built SigLIP 2 bundle")
+    p.add_argument("--precision", default="w8a16", choices=["w8a16", "float"])
+    p.add_argument("--runtime", default="qnn_dlc", choices=["qnn_dlc", "onnx", "tflite"])
+    p.add_argument("--out", default="assets")
+    p.set_defaults(func=cmd_siglip2_fetch)
+    for name, fn, helptext in [("infer", cmd_siglip2_infer, "embed your images (and score labels) on the S25"),
+                               ("profile", cmd_siglip2_profile, "AI Hub profile job, same as AI Hub's published numbers")]:
+        p = s.add_parser(name, help=helptext)
+        p.add_argument("--bundle", default="assets/siglip2-qnn_dlc-w8a16", help="folder from `hexprof siglip2 fetch`")
+        p.add_argument("--precision", default="w8a16", choices=["w8a16", "float"], help="used when the bundle is fetched")
+        p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
+        p.add_argument("--qairt-version", help="AI Hub QAIRT version (default: the one the asset was verified with; 'default' = AI Hub's)")
+        p.add_argument("--options", default="", help="extra AI Hub inference/profile options")
+        p.add_argument("--no-hw", action="store_true", help="skip optrace / QHAS download")
+        p.add_argument("--out")
+        if name == "infer":
+            p.add_argument("--image", action="append", help="image file or folder (repeatable)")
+            p.add_argument("--labels", nargs="+", help="text labels for zero-shot scores (runs the text encoder too)")
+            p.add_argument("--logit-scale", type=float, help="skip the HF download of SigLIP's logit scale")
+            p.add_argument("--logit-bias", type=float)
+        else:
+            p.add_argument("--components", nargs="+", default=["image_encoder"], choices=["image_encoder", "text_encoder"])
+        p.set_defaults(func=fn)
+
+    # ---- hub
+    h = sub.add_parser("hub", help="generic AI Hub profiling").add_subparsers(dest="sub", required=True)
+    p = h.add_parser("profile", help="profile any compiled model (.dlc/.bin/.tflite/.onnx or AI Hub model id)")
+    p.add_argument("model")
+    p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
+    p.add_argument("--options", default="")
+    p.add_argument("--hw", action="store_true")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_hub_profile)
+    p = h.add_parser("metrics", help="AI Hub metrics of an existing profile job")
+    p.add_argument("job_id")
+    p.add_argument("--hw", action="store_true")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_hub_metrics)
+
+    # ---- hw
+    w = sub.add_parser("hw", help="optrace / QHAS hardware metrics").add_subparsers(dest="sub", required=True)
+    p = w.add_parser("fields", help="list record tables and fields in optrace / QHAS JSON files")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--max-chars", type=int, default=20000)
+    p.set_defaults(func=cmd_hw_fields)
+    p = w.add_parser("classify", help="compute- / memory-bound / overhead per operator")
+    p.add_argument("--job", help="AI Hub profile job id (downloads profile + artifacts)")
+    p.add_argument("--trace", action="append", help="optrace / QHAS JSON file(s)")
+    p.add_argument("--profile", help="AI Hub profile JSON for per-layer timing")
+    p.add_argument("--compute-json", help="compute_ceiling.json from `hexprof ceilings compute`")
+    p.add_argument("--bandwidth-json", help="bandwidth_ceiling.json from `hexprof ceilings bandwidth`")
+    p.add_argument("--bandwidth-gbps", type=float, help="B directly (overrides --bandwidth-json)")
+    p.add_argument("--util-threshold", type=float, default=0.6)
+    p.add_argument("--bw-fraction", type=float, default=0.7)
+    p.add_argument("--field-map", nargs="*", help="override field mapping, e.g. hmx_util=hmx.utilization_pct")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_hw_classify)
+
+    # ---- ceilings
+    c = sub.add_parser("ceilings", help="measure NPU compute / bandwidth ceilings on AI Hub").add_subparsers(dest="sub", required=True)
+    p = c.add_parser("compute", help="chained square MatMuls per precision -> P, t0")
+    _add_sweep_args(p)
+    p.add_argument("--precisions", nargs="+", default=["w8a16", "w4a16", "fp16"],
+                   help="weight/activation pairs of the deployment (fp16 = Gemma 4 vision encoder)")
+    p.add_argument("--size", type=int, default=2048, help="K = N (multiple of 32)")
+    p.add_argument("--rows", type=int, help="M (default = size)")
+    p.add_argument("--chain", nargs="+", type=int, default=[1, 2, 4, 8, 16], help="L values")
+    p.set_defaults(func=cmd_ceilings_compute)
+
+    p = c.add_parser("bandwidth", help="single-token linear stacks (width) and Gemma 4 decoder subsets (depth) -> B, t0")
+    _add_sweep_args(p)
+    _add_dims_args(p)
+    p.add_argument("--precision", default="w4a16", help="deployed weight precision (Gemma 4 blocks: w4a16)")
+    p.add_argument("--widths", nargs="*", type=int, default=[3072, 4096, 5120, 6144])
+    p.add_argument("--width-layers", type=int, default=16)
+    p.add_argument("--gemma4-layers", nargs="*", type=int, default=[], help="depth sweep, e.g. 4 8 12")
+    p.add_argument("--context", type=int, default=4096, help="static KV-cache length of the decoder subsets")
+    p.add_argument("--include-kv", action="store_true", help="add KV-cache bytes to the x-axis")
+    p.add_argument("--onchip-mb", type=float, default=16.0, help="VTCM + system cache, for the off-chip check")
+    p.set_defaults(func=cmd_ceilings_bandwidth)
+
+    p = c.add_parser("kv-check", help="decode latency with empty vs full KV cache")
+    _add_dims_args(p)
+    p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
+    p.add_argument("--runtime", default="qnn_context_binary", choices=["qnn_context_binary", "qnn_dlc"])
+    p.add_argument("--qairt-version")
+    p.add_argument("--precision", default="w4a16")
+    p.add_argument("--layers", type=int, default=4)
+    p.add_argument("--context", type=int, default=4096)
+    p.add_argument("--tolerance", type=float, default=0.03)
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_ceilings_kv)
+
+    # ---- pipeline
+    pl = sub.add_parser("pipeline", help="fine-tuned model -> AI Hub -> phone").add_subparsers(dest="model", required=True)
+    pg = pl.add_parser("gemma4", help="fine-tuned Gemma 4 E4B (Qualcomm's export recipe)").add_subparsers(dest="sub", required=True)
+    p = pg.add_parser("quantize", help="ONNX export + AIMET w4a16 calibration (GPU)")
+    p.add_argument("--checkpoint", required=True, help="fine-tuned HF checkpoint dir")
+    p.add_argument("--out", required=True)
+    p.add_argument("--num-samples", type=int, default=20)
+    p.add_argument("--context-length", type=int, help="shorter KV cache = less memory and attention per step")
+    p.add_argument("--sequence-length", type=int, help="prompt-processor chunk (default 128)")
+    p.add_argument("--export-only", action="store_true", help="stage A only (CPU)")
+    p.add_argument("extra", nargs=argparse.REMAINDER, help="extra args for the Qualcomm script (after --)")
+    p.set_defaults(func=cmd_pipeline_quantize)
+    p = pg.add_parser("export", help="compile + link + profile on AI Hub, build the GenieX bundle")
+    p.add_argument("--checkpoint", required=True, help="quantized checkpoint from `pipeline gemma4 quantize`")
+    p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
+    p.add_argument("--target-runtime", default="geniex_qairt", choices=["geniex_qairt", "genie", "qnn_context_binary"])
+    p.add_argument("--precision", default="w4a16")
+    p.add_argument("--no-hw", action="store_true")
+    p.add_argument("--out")
+    p.add_argument("extra", nargs=argparse.REMAINDER, help="extra `qai-hub-models export` args (after --)")
+    p.set_defaults(func=cmd_pipeline_export)
+    return ap
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if hasattr(args, "extra") and args.extra and args.extra[0] == "--":
+        args.extra = args.extra[1:]
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        print("interrupted (AI Hub jobs keep running; re-run with the same --out to resume)", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

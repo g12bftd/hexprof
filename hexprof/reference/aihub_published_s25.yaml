@@ -1,0 +1,30 @@
+# Numbers Qualcomm AI Hub Models publishes for the Samsung Galaxy S25.
+# Source: qai_hub_models 0.65.0, models/gemma_4_e4b_it/perf.yaml and models/siglip2/perf.yaml
+# (also shown by `qai-hub-models perf Gemma-4-E4B-it` / `qai-hub-models perf SigLIP2`).
+# hexprof prints its own measurements next to these.
+source: qai_hub_models==0.65.0
+device: Samsung Galaxy S25
+gemma_4_e4b_it:
+  q4_0:
+    geniex_llamacpp:
+      model_infer_id: google/gemma-4-E4B-it-qat-q4_0-gguf
+      llm_metrics:
+        - {context_length: 4096, desired_compute_unit: cpu, prefill_tokens_per_second: 57.058449, tokens_per_second: 11.908334, time_to_first_token_range_milliseconds: {min: 2243.354870967742, max: 71787.35587096775}}
+        - {context_length: 512, desired_compute_unit: cpu, prefill_tokens_per_second: 102.878095, tokens_per_second: 17.193389, time_to_first_token_range_milliseconds: {min: 1244.5173333333332, max: 4978.069333333333}}
+        - {context_length: 4096, desired_compute_unit: gpu, prefill_tokens_per_second: 129.880485, tokens_per_second: 11.831827, time_to_first_token_range_milliseconds: {min: 985.5867741935483, max: 31538.776774193546}}
+        - {context_length: 512, desired_compute_unit: gpu, prefill_tokens_per_second: 185.388669, tokens_per_second: 14.849922, time_to_first_token_range_milliseconds: {min: 691.1736666666667, max: 2764.6946666666668}}
+        - {context_length: 4096, desired_compute_unit: npu, prefill_tokens_per_second: 727.899901, tokens_per_second: 13.356142, time_to_first_token_range_milliseconds: {min: 175.91751612903226, max: 5629.3605161290325}}
+        - {context_length: 512, desired_compute_unit: npu, prefill_tokens_per_second: 927.014506, tokens_per_second: 14.937384, time_to_first_token_range_milliseconds: {min: 138.82733333333334, max: 555.3093333333334}}
+siglip2:
+  w8a16:
+    image_encoder:
+      qnn_dlc: {inference_time_milliseconds: 3.319, estimated_peak_memory_range_mb: {min: 0, max: 180}, layer_counts: {npu: 404, total: 404}, primary_compute_unit: NPU, job_id: jpx0kk1jp, qairt: 2.50.0.260828221209}
+      onnx: {inference_time_milliseconds: 2.852, estimated_peak_memory_range_mb: {min: 0, max: 189}, layer_counts: {npu: 414, total: 414}, primary_compute_unit: NPU, job_id: jp1o447l5}
+    text_encoder:
+      qnn_dlc: {inference_time_milliseconds: 1.25, estimated_peak_memory_range_mb: {min: 0, max: 186}, layer_counts: {npu: 380, total: 380}, primary_compute_unit: NPU, job_id: j5m9nnzyg, qairt: 2.50.0.260828221209}
+      onnx: {inference_time_milliseconds: 1.244, estimated_peak_memory_range_mb: {min: 0, max: 190}, layer_counts: {npu: 388, total: 388}, primary_compute_unit: NPU, job_id: jgd6xx8lp}
+  float:
+    image_encoder:
+      qnn_dlc: {inference_time_milliseconds: 4.228, estimated_peak_memory_range_mb: {min: 0, max: 162}, layer_counts: {npu: 404, total: 404}, primary_compute_unit: NPU, job_id: jpe6dm3vg}
+    text_encoder:
+      qnn_dlc: {inference_time_milliseconds: 2.478, estimated_peak_memory_range_mb: {min: 0, max: 139}, layer_counts: {npu: 380, total: 380}, primary_compute_unit: NPU, job_id: j5wye6nmg}

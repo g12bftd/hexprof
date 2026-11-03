@@ -1,0 +1,72 @@
+{
+    "model_id": "siglip2",
+    "model_name": "SigLIP2",
+    "runtime": "qnn_dlc",
+    "precision": "w8a16",
+    "tool_versions": {
+        "qairt": "2.50.0.260828221209"
+    },
+    "model_files": {
+        "image_encoder.dlc": {
+            "inputs": {
+                "image": {
+                    "shape": [
+                        1,
+                        224,
+                        224,
+                        3
+                    ],
+                    "dtype": "uint16",
+                    "quantization_parameters": {
+                        "scale": 0.000015259021893143654,
+                        "zero_point": 0
+                    },
+                    "io_type": "image",
+                    "image_metadata": {},
+                    "value_range": [
+                        0.0,
+                        1.0
+                    ]
+                }
+            },
+            "outputs": {
+                "image_embeds": {
+                    "shape": [
+                        1,
+                        768
+                    ],
+                    "dtype": "uint16",
+                    "quantization_parameters": {
+                        "scale": 0.0000111501485662302,
+                        "zero_point": 15780
+                    }
+                }
+            }
+        },
+        "text_encoder.dlc": {
+            "inputs": {
+                "input_ids": {
+                    "shape": [
+                        1,
+                        64
+                    ],
+                    "dtype": "int32"
+                }
+            },
+            "outputs": {
+                "text_embeds": {
+                    "shape": [
+                        1,
+                        768
+                    ],
+                    "dtype": "uint16",
+                    "quantization_parameters": {
+                        "scale": 0.000014633622413384728,
+                        "zero_point": 42025
+                    }
+                }
+            }
+        }
+    },
+    "use_case": "Image Classification"
+}
