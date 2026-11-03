@@ -85,7 +85,14 @@ def run_official_export(checkpoint: str | Path, out_dir: str | Path, device_name
     parser = build_export_parser_for(source_dir)
     args = parser.parse_args(argv)
     print(f"qai-hub-models export {MODEL_ID} " + " ".join(argv))
-    return select_pipeline(source_dir)(**vars(args))
+    try:  # batch jobs (e.g. Slurm) have no stdin: answer Qualcomm's yes/no prompts with "yes"
+        from qai_hub_models.utils.asset_loaders import always_answer_prompts  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - older qai_hub_models
+        always_answer_prompts = None
+    if always_answer_prompts is None:
+        return select_pipeline(source_dir)(**vars(args))
+    with always_answer_prompts(True):
+        return select_pipeline(source_dir)(**vars(args))
 
 
 def export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
