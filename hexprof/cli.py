@@ -204,6 +204,16 @@ def cmd_gemma4_aihub(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gemma4_efficiency(args: argparse.Namespace) -> int:
+    from hexprof.models import gemma4_aihub, gemma4_efficiency
+
+    gemma4_efficiency.efficiency(args.export_dir or gemma4_aihub.default_export_dir(), config=args.config,
+                                 compute_json=args.compute_json, bandwidth_json=args.bandwidth_json,
+                                 peak_tops=args.peak_tops, peak_gbps=args.peak_gbps,
+                                 measure_binaries=args.measure_binaries, qhas_max_mb=args.qhas_max_mb)
+    return 0
+
+
 # --------------------------------------------------------------------------- siglip2
 
 
@@ -473,6 +483,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-hw", action="store_true", help="skip optrace / QHAS download")
     p.add_argument("--out", help="output dir (default runs/gemma4-aihub-<time>)")
     p.set_defaults(func=cmd_gemma4_aihub)
+
+    p = g.add_parser("efficiency", help="per compiled part: operations, bytes, achieved TOPS and GB/s, "
+                                        "QHAS utilization and inferences/s (after `gemma4 aihub --export-only`)")
+    p.add_argument("--export-dir", help="default: <download-dir>/gemma4-s25-export or runs/gemma4-s25-export")
+    p.add_argument("--config", help="Gemma 4 config.json (default: the one in Qualcomm's downloaded checkpoint)")
+    p.add_argument("--compute-json", help="compute_ceiling.json from `hexprof ceilings compute` (gives %% of P)")
+    p.add_argument("--bandwidth-json", help="bandwidth_ceiling.json from `hexprof ceilings bandwidth` (gives %% of B)")
+    p.add_argument("--peak-tops", type=float, help="use this P instead of a ceilings file")
+    p.add_argument("--peak-gbps", type=float, help="use this B instead of a ceilings file")
+    p.add_argument("--measure-binaries", action="store_true",
+                   help="download the compiled context binaries to cross-check byte counts")
+    p.add_argument("--qhas-max-mb", type=float, default=1024,
+                   help="parse QHAS files up to this size fully; larger ones are scanned (vision encoder: ~3.5 GB)")
+    p.set_defaults(func=cmd_gemma4_efficiency)
 
     p = g.add_parser("setup", help="install geniex-bench on the phone and pull the model there")
     _add_phone_args(p)

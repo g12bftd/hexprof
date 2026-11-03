@@ -119,6 +119,20 @@ hexprof gemma4 aihub --download-dir ~/hexprof-data --image photo.jpg --prompt "W
 * Output in `runs/gemma4-aihub-<time>/`: `results.md` with the answer and the stage table, `results.json`,
   and the vision encoder's output embeddings as `.npy`.
 
+### How well each part uses the NPU
+
+```bash
+hexprof gemma4 efficiency
+```
+
+For every compiled part (after the export): operations and bytes per run (from the model config and
+Qualcomm's w4a16 recipe), achieved TOPS and GB/s, operations per byte, the whole-model decode and
+prefill rates, and QHAS's graph-level fields ("% of overall timeline HTP utilization", inferences per
+second). Those QHAS numbers are time-based: how much of the run the NPU was busy, and how many runs fit
+in a second. They are not compute or bandwidth utilisation. Add `--compute-json` / `--bandwidth-json`
+from `hexprof ceilings` (or `--peak-tops` / `--peak-gbps`) for % of peak and the roofline bound per part,
+and `--measure-binaries` to cross-check bytes against the compiled binaries.
+
 ## Gemma 4 on the S25 (GenieX, NPU)
 
 ### 1. One-time setup
