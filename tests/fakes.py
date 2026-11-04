@@ -216,8 +216,16 @@ class FakeHub:
             return self._job(target=self._model({**model.payload, "precision": precision.name}))
 
         def compile_(model: FakeModel, dev: Any, name: str, options: str = "", input_specs: Any = None) -> FakeJob:
+            if "--target_runtime qnn_context_binary" in options:  # as AI Hub answers today
+                raise RuntimeError("argument --target_runtime: Unsupported target runtime: qnn_context_binary. "
+                                   "Expecting one of 'onnx', 'precompiled_qnn_onnx', 'qnn_dlc', 'tflite'")
             self.calls.append(("compile", name, options))
             return self._job(target=self._model({**model.payload, "compile_options": options}))
+
+        def link(models: list[FakeModel], dev: Any, name: str, options: str = "") -> FakeJob:
+            assert all("--target_runtime qnn_dlc" in m.payload.get("compile_options", "") for m in models)
+            self.calls.append(("link", name, options))
+            return self._job(target=self._model({**models[0].payload, "linked": True}))
 
         def infer(model: FakeModel, dev: Any, inputs: Any = None, *, profile: bool = True, name: str | None = None,
                   options: str = "") -> FakeJob:
@@ -229,5 +237,7 @@ class FakeHub:
 
         monkeypatch.setattr(hc, "submit_quantize", quantize)
         monkeypatch.setattr(hc, "submit_compile", compile_)
+        monkeypatch.setattr(hc, "submit_link", link)
+        monkeypatch.setattr(hc, "qairt_version", lambda job: "2.50.0")
         monkeypatch.setattr(hc, "submit_inference", infer)
         return self

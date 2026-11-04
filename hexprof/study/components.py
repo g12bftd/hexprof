@@ -53,7 +53,7 @@ def settings(target: str, axis: str, value: str, fixed: dict[str, Any]) -> dict[
     elif axis == "precision":
         s["precision"] = value
     elif axis == "qairt":
-        s["qairt"] = value
+        s["qairt"] = None if value == "qualcomm" else value  # "qualcomm": qai_hub_models' pinned version
     elif axis == "mixed-precision":
         base = fixed.get("precision") or "w8a16"
         if base not in core.QUANTIZED:
@@ -82,6 +82,7 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
     from qai_hub_models import Precision, TargetRuntime  # type: ignore[import-not-found]
     from qai_hub_models.utils.export.compile import run_compile  # type: ignore[import-not-found]
     from qai_hub_models.utils.export.quantize import run_quantize  # type: ignore[import-not-found]
+    from qai_hub_models.utils.export.link import run_link  # type: ignore[import-not-found]
     from qai_hub_models.utils.export.upload import upload_source  # type: ignore[import-not-found]
 
     from hexprof.aihub import client as hc
@@ -101,7 +102,7 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
     name = f"hexprof_{target}_{axis}_{value}".replace(".", "_")
     qflag = f"--qairt_version {s['qairt']}" if s["qairt"] else ""
     print(f"    {cls_name}.from_pretrained({s['from_kwargs']}), get_input_spec({s['spec_kwargs']}) -> "
-          f"{core.shapes_of(spec)}; precision {prec}; {qflag or 'AI Hub default QAIRT'}", flush=True)
+          f"{core.shapes_of(spec)}; precision {prec}; {qflag or 'QAIRT pinned by qai_hub_models'}", flush=True)
 
     source = _staged(state, state_path, "source_model_id", lambda: upload_source(model, spec))
     if prec != Precision.float:
@@ -129,9 +130,13 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
     cjob = _staged(state, state_path, "compile_job",
                    lambda: run_compile(model, name, dev, TargetRuntime.QNN_CONTEXT_BINARY, prec, source, spec,
                                        extra_options=qflag))
-    compiled = hc.target_model(cjob)
+    dlc = hc.target_model(cjob)  # Qualcomm's compile options target qnn_dlc; the link job makes the context binary
+    ljob = _staged(state, state_path, "link_job",
+                   lambda: run_link(dlc, dev, name, model, TargetRuntime.QNN_CONTEXT_BINARY, extra_options=qflag))
+    binary = hc.target_model(ljob)
+    popts = model.get_hub_inference_options(TargetRuntime.QNN_CONTEXT_BINARY, qflag)
     pjob = _staged(state, state_path, "profile_job",
-                   lambda: hc.submit_inference(compiled, dev, None, profile=True, name=name, options=qflag))
+                   lambda: hc.submit_inference(binary, dev, None, profile=True, name=name, options=popts))
     hc.wait_success(pjob, "profile")
     comp_dir = vdir / component
     prof, _ = hc.save_profile(pjob, comp_dir, component)
@@ -169,8 +174,13 @@ def verify(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any]
     core.check(checks, "compiled model input shapes (AI Hub)", local, built,
                set(built) == set(local) and all(_same_dims(built[k], local[k]) for k in local))
     if getattr(pjob, "model", None) is not None:
-        core.check(checks, "profiled model = compiled model", compiled.model_id, pjob.model.model_id,
-                   pjob.model.model_id == compiled.model_id)
+        binary = hc.target_model(hc.get_job(jobs["link_job"])) if jobs.get("link_job") else compiled
+        core.check(checks, "profiled model = linked context binary", binary.model_id, pjob.model.model_id,
+                   pjob.model.model_id == binary.model_id)
+    if jobs.get("link_job"):
+        ljob = hc.get_job(jobs["link_job"])
+        linked = [m.model_id for m in (getattr(ljob, "models", None) or [])]
+        core.check(checks, "link job consumed the compiled model", compiled.model_id, linked, compiled.model_id in linked)
     core.device_check(checks, pjob, device, "profile device")
     if axis == "batch":
         b = int(value)
@@ -206,6 +216,11 @@ def verify(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any]
         ok = bool(q_used and want_q and (q_used == want_q["full_version"] or q_used.startswith(want_q["api_version"])))
         core.check(checks, "QAIRT version on device", want_q or s["qairt"], q_used, ok,
                    "tags like 'latest' are resolved now; re-verify soon after the run")
+    elif axis == "qairt":
+        pin = core.qualcomm_qairt()
+        core.check(checks, "QAIRT version on device (qai_hub_models' pin)", pin, q_used,
+                   bool(q_used and pin and q_used.startswith(pin)),
+                   "the version qai_hub_models compiles, links and runs with when none is given")
     return core.summarize(checks, qairt=q_used, calibration=jobs.get("calibration", "Qualcomm's calibration data"))
 
 

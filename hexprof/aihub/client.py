@@ -104,7 +104,9 @@ def submit_compile(model: Any, dev: Any, name: str, options: str = "", input_spe
 
 
 def submit_link(models: list[Any], dev: Any, name: str, options: str = "") -> Any:
-    return hub().submit_link_job(models, device=dev, name=name, options=options)
+    """Link compiled QNN DLCs into one context binary (weights shared between the graphs)."""
+    job = hub().submit_link_job(models, device=dev, name=name, options=options)
+    return job[0] if isinstance(job, list) else job
 
 
 def submit_inference(
@@ -183,6 +185,17 @@ def download_hw_artifacts(job: Any, out_dir: str | Path) -> dict[str, list[str]]
             out[key] = []
             out[f"{key}_error"] = [f"{type(e).__name__}: {e}"]
     return out
+
+
+def qairt_version(job: Any) -> str | None:
+    """QAIRT version AI Hub used for a compile / link / profile job (Qualcomm's ToolVersions.from_job)."""
+    try:
+        from qai_hub_models.configs.tool_versions import ToolVersions  # type: ignore[import-not-found]
+
+        q = getattr(ToolVersions.from_job(job), "qairt", None)
+        return None if q is None else str(getattr(q, "full_version", None) or getattr(q, "api_version", None) or q)
+    except Exception:  # noqa: BLE001 - informative only
+        return None
 
 
 def job_info(job: Any) -> dict[str, Any]:

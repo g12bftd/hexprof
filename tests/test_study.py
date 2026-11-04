@@ -202,6 +202,9 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
         def get_hub_litemp_percentage(self, prec):
             return None
 
+        def get_hub_inference_options(self, rt, other=""):
+            return (other or "--qairt_version 2.50").strip()
+
         def get_hub_quantize_options(self, prec):  # as Qualcomm's build_quantize_options
             if "_mixed_" in prec.name:
                 pct = self.get_hub_litemp_percentage(prec)
@@ -237,6 +240,13 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
         store["models"][j.target.model_id] = j.target
         return j
 
+    def run_link(compiled, dev, name, model, rt, extra_options=""):
+        j = types.SimpleNamespace(job_id=new_id("lj"), models=[compiled], options=extra_options)
+        j.target = Model(new_id("bin"), input_spec=compiled.input_spec)
+        store["jobs"][j.job_id] = j
+        store["models"][j.target.model_id] = j.target
+        return j
+
     def submit_inference(model, dev, inputs, profile=True, name="", options=""):
         j = ProfileJob(new_id("pj"), model, options)
         store["jobs"][j.job_id] = j
@@ -257,6 +267,7 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
         "qai_hub_models.utils.export.compile": types.SimpleNamespace(run_compile=run_compile),
         "qai_hub_models.utils.export.quantize": types.SimpleNamespace(run_quantize=run_quantize),
         "qai_hub_models.utils.export.upload": types.SimpleNamespace(upload_source=upload_source),
+        "qai_hub_models.utils.export.link": types.SimpleNamespace(run_link=run_link),
         "qai_hub_models.models": types.ModuleType("m"), "qai_hub_models.models.siglip2": types.ModuleType("s"),
         "qai_hub_models.models.siglip2.model": types.SimpleNamespace(SigLIP2TextEncoder=TextEncoder,
                                                                      SigLIP2ImageEncoder=TextEncoder),
@@ -288,7 +299,10 @@ def test_siglip_text_batch_study(tmp_path, monkeypatch):
     ver = json.loads((out / "batch-4" / "verification.json").read_text())
     names = {c["what"] for c in ver["checks"]}
     assert {"compile job input shapes", "compiled model input shapes (AI Hub)", "batch dimension",
-            "compile job consumed the quantized model", "quantize job dtypes", "profile device"} <= names
+            "compile job consumed the quantized model", "quantize job dtypes", "profile device",
+            "link job consumed the compiled model", "profiled model = linked context binary"} <= names
+    jobs = json.loads((out / "batch-4" / "jobs.json").read_text())
+    assert jobs["link_job"].startswith("lj")
     v = json.loads((out / "batch-4" / "variant.json").read_text())
     assert v["settings"]["spec_kwargs"] == {"text_batch_size": 4} and v["settings"]["precision"] == "w8a16"
 

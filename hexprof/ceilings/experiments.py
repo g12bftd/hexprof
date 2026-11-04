@@ -60,7 +60,8 @@ def compute_sweep(sweep: Sweep, precisions: Sequence[str], size: int, chain: Seq
         return {"records": records}
     series = _series(records, "ops")
     result: dict[str, Any] = {"experiment": "compute", "size": size, "rows": rows or size, "chain": list(chain),
-                              "device": sweep.device_name, "runtime": sweep.runtime, "series": {}}
+                              "device": sweep.device_name, "runtime": sweep.runtime, "series": {},
+                              "qairt": sorted({r["qairt"] for r in records if r.get("qairt")})}
     rows_md = []
     for label, s in series.items():
         entry: dict[str, Any] = {"points": [{"key": k, "ops": x, "latency_ms": y} for k, x, y in zip(s["keys"], s["x"], s["y_ms"])]}
@@ -118,6 +119,7 @@ def bandwidth_sweep(
     series = _series(records, x_key)
     result: dict[str, Any] = {"experiment": "bandwidth", "precision": prec.name, "device": sweep.device_name,
                               "runtime": sweep.runtime, "x_axis": x_key, "possibly_on_chip": small,
+                              "qairt": sorted({r["qairt"] for r in records if r.get("qairt")}),
                               "gemma4_dims": dims.__dict__ if dims else None, "series": {}}
     rows_md = []
     for label, s in series.items():
@@ -162,10 +164,11 @@ def kv_cache_check(
     sweep._build_and_upload([spec])
     sweep._quantize([spec])
     sweep._compile([spec])
+    sweep._link([spec])
     st = sweep.state[key]
     if "error" in st:
         raise hc.HubJobError(st["error"])
-    model = hc.target_model(hc.get_job(st["compile_job"]))
+    model = sweep.deployable(st)
     dev = hc.device(device_name)
     opts = f"--qairt_version {qairt_version}" if qairt_version else ""
     jobs = {}

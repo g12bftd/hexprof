@@ -1,4 +1,8 @@
-"""Run ceiling sweeps on AI Hub: build -> upload -> quantize -> compile -> profile.
+"""Run ceiling sweeps on AI Hub: build -> upload -> quantize -> compile -> link -> profile.
+
+A QNN context binary (what GenieX QAIRT loads) is made the way AI Hub requires it now and the way
+Qualcomm's own export does it: compile to ``qnn_dlc``, then a link job turns the DLC into a context
+binary (AI Hub no longer accepts ``--target_runtime qnn_context_binary`` on compile jobs).
 
 All jobs of a stage are submitted before waiting, so AI Hub runs them in
 parallel. Job ids are written to ``<out>/state.json`` after every submission;
@@ -63,8 +67,12 @@ class Sweep:
     def _save(self) -> None:
         write_json(self.state_path, self.state)
 
+    @property
+    def links(self) -> bool:
+        return self.runtime == "qnn_context_binary"
+
     def _compile_opts(self, precision: hc.Precision) -> str:
-        opts = [f"--target_runtime {self.runtime}"]
+        opts = [f"--target_runtime {'qnn_dlc' if self.links else self.runtime}"]
         if self.quantize_io and not precision.is_float:
             opts.append("--quantize_io")
         if self.qairt_version:
@@ -72,6 +80,13 @@ class Sweep:
         if self.compile_options:
             opts.append(self.compile_options)
         return " ".join(opts)
+
+    def _link_opts(self) -> str:
+        return f"--qairt_version {self.qairt_version}" if self.qairt_version else ""
+
+    def deployable(self, st: dict[str, Any]) -> Any:
+        """The model that runs on the device: the linked context binary, or the compiled model."""
+        return hc.target_model(hc.get_job(st.get("link_job") or st["compile_job"]))
 
     def _profile_opts(self) -> str:
         opts = []
@@ -158,6 +173,23 @@ class Sweep:
             self._save()
         self._wait_all(pending, "compile", "compile_job")
 
+    def _link(self, specs: Sequence[PointSpec]) -> None:
+        if not self.links:
+            return
+        dev = hc.device(self.device_name)
+        pending: dict[str, Any] = {}
+        for s in self._ok(specs):
+            st = self.state[s.key]
+            if st.get("link_job"):
+                continue
+            dlc = hc.target_model(hc.get_job(st["compile_job"]))
+            job = hc.submit_link([dlc], dev, name=f"hexprof {s.key}", options=self._link_opts())
+            job = job[0] if isinstance(job, list) else job
+            st["link_job"] = job.job_id
+            pending[s.key] = job
+            self._save()
+        self._wait_all(pending, "link", "link_job")
+
     def _profile(self, specs: Sequence[PointSpec]) -> None:
         dev = hc.device(self.device_name)
         pending: dict[str, Any] = {}
@@ -165,8 +197,7 @@ class Sweep:
             st = self.state[s.key]
             if st.get("profile_job"):
                 continue
-            model = hc.target_model(hc.get_job(st["compile_job"]))
-            job = hc.submit_inference(model, dev, None, profile=True, name=f"hexprof {s.key}",
+            job = hc.submit_inference(self.deployable(st), dev, None, profile=True, name=f"hexprof {s.key}",
                                       options=self._profile_opts())
             st["profile_job"] = job.job_id
             pending[s.key] = job
@@ -181,6 +212,7 @@ class Sweep:
             job = hc.get_job(st["profile_job"])
             prof, _ = hc.save_profile(job, self.out / "profiles", s.key)
             st["metrics"] = aihub_metrics(prof)
+            st["qairt"] = hc.qairt_version(job)
             st["latency_ms"] = st["metrics"]["inference_time_milliseconds"]
             st["job_url"] = job.url
             write_json(self.out / "profiles" / f"{s.key}.per_layer.json", per_layer(prof))
@@ -196,7 +228,7 @@ class Sweep:
             return [self.state[s.key] for s in specs]
         for s in specs:  # a re-run retries points that failed last time
             self.state[s.key].pop("error", None)
-        for stage in (self._quantize, self._compile, self._profile, self._collect):
+        for stage in (self._quantize, self._compile, self._link, self._profile, self._collect):
             stage(specs)
         failed = [s.key for s in specs if "error" in self.state[s.key]]
         if failed:

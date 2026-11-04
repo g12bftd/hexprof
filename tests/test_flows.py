@@ -187,8 +187,13 @@ def test_compute_and_bandwidth_sweeps_recover_simulated_ceilings(tmp_path, monke
     assert ("quantize", "hexprof compute-w8a16-s64-m64-l1", "") in hub.calls
     assert not any(c[0] == "quantize" and "fp16" in c[1] for c in hub.calls)  # float graphs skip quantization
     compiles = {name: opts for kind, name, opts in hub.calls if kind == "compile"}
-    assert compiles["hexprof compute-w8a16-s64-m64-l1"] == "--target_runtime qnn_context_binary --quantize_io"
-    assert compiles["hexprof compute-fp16-s64-m64-l1"] == "--target_runtime qnn_context_binary"
+    assert compiles["hexprof compute-w8a16-s64-m64-l1"] == "--target_runtime qnn_dlc --quantize_io"
+    assert compiles["hexprof compute-fp16-s64-m64-l1"] == "--target_runtime qnn_dlc"
+    links = [c for c in hub.calls if c[0] == "link"]
+    assert len(links) == 8  # every point: DLC -> context binary, as Qualcomm's export does
+    profiled = [j.model.payload for j in hub.jobs.values() if j.profile]
+    assert profiled and all(m.get("linked") for m in profiled)
+    assert res["qairt"] == ["2.50.0"]
 
     n_before = len(hub.calls)
     experiments.compute_sweep(Sweep(tmp_path, "Samsung Galaxy S25"), ["w8a16", "fp16"], 64, [1, 2, 4, 8])

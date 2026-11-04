@@ -473,7 +473,7 @@ def _sweep(args: argparse.Namespace, prefix: str):  # noqa: ANN202
 def _add_sweep_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--device", default=DEFAULT_HUB_DEVICE, help="AI Hub device name")
     p.add_argument("--runtime", default="qnn_context_binary", choices=["qnn_context_binary", "qnn_dlc"],
-                   help="AI Hub target runtime (context binary = what GenieX QAIRT loads)")
+                   help="qnn_context_binary (what GenieX QAIRT loads) = compile to qnn_dlc + link job; qnn_dlc = no link")
     p.add_argument("--qairt-version", help="pin QAIRT on AI Hub (e.g. 2.50)")
     p.add_argument("--compile-options", default="")
     p.add_argument("--profile-options", default="", help="e.g. '--max_profiler_iterations 200'")

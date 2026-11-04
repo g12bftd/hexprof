@@ -23,19 +23,19 @@ AXES: dict[str, dict[str, list[str]]] = {
         "image-size": ["224", "336", "448", "560"],
         "precision": ["float", "w8a16"],
         "mixed-precision": ["0", "5", "10", "25", "50"],
-        "qairt": ["default", "latest"],
+        "qairt": ["qualcomm", "default", "latest"],
     },
     "siglip2-image": {
         "batch": ["1", "2", "4", "8"],
         "precision": ["float", "w8a16", "w8a8", "w4a16"],
         "mixed-precision": ["0", "5", "10", "25", "50"],
-        "qairt": ["default", "latest"],
+        "qairt": ["qualcomm", "default", "latest"],
     },
     "siglip2-text": {
         "batch": ["1", "2", "4", "8", "16"],
         "precision": ["float", "w8a16", "w8a8", "w4a16"],
         "mixed-precision": ["0", "5", "10", "25", "50"],
-        "qairt": ["default", "latest"],
+        "qairt": ["qualcomm", "default", "latest"],
     },
 }
 NUMERIC_AXES = {"context-length", "prompt-length", "decode-tokens", "image-size", "batch", "mixed-precision"}
@@ -44,7 +44,8 @@ BASELINE = {  # Qualcomm's shipped setting per axis: the reference every study i
     ("gemma4-text", "decode-tokens"): "1", ("gemma4-vision", "image-size"): "448",
     ("gemma4-vision", "precision"): "float", ("siglip2-image", "batch"): "1", ("siglip2-text", "batch"): "1",
     ("siglip2-image", "precision"): "w8a16", ("siglip2-text", "precision"): "w8a16",
-    ("gemma4-vision", "qairt"): "default", ("siglip2-image", "qairt"): "default", ("siglip2-text", "qairt"): "default",
+    # qairt: "qualcomm" = the version qai_hub_models pins (what its exports use); default / latest = AI Hub tags
+    ("gemma4-vision", "qairt"): "qualcomm", ("siglip2-image", "qairt"): "qualcomm", ("siglip2-text", "qairt"): "qualcomm",
     # mixed precision: 0 = no layers overridden (the plain base precision)
     ("gemma4-vision", "mixed-precision"): "0", ("siglip2-image", "mixed-precision"): "0",
     ("siglip2-text", "mixed-precision"): "0",
@@ -208,15 +209,19 @@ def dtypes_of(spec: Any) -> dict[str, str]:
 
 def qairt_of(job: Any) -> str | None:
     """QAIRT version AI Hub used for this job (Qualcomm's ToolVersions.from_job)."""
-    try:
-        from qai_hub_models.configs.tool_versions import ToolVersions  # type: ignore[import-not-found]
+    from hexprof.aihub import client as hc
 
-        tv = ToolVersions.from_job(job)
-        q = getattr(tv, "qairt", None)
-        if q is None:
-            return None
-        return str(getattr(q, "full_version", None) or getattr(q, "api_version", None) or q)
-    except Exception:  # noqa: BLE001 - version is informative unless the axis is qairt
+    return hc.qairt_version(job)
+
+
+def qualcomm_qairt() -> str | None:
+    """The QAIRT version Qualcomm's qai_hub_models pins for context binaries (used when none is given)."""
+    try:
+        from qai_hub_models import TargetRuntime  # type: ignore[import-not-found]
+
+        v = TargetRuntime.QNN_CONTEXT_BINARY.default_qairt_version
+        return str(getattr(v, "api_version", None) or v)
+    except Exception:  # noqa: BLE001
         return None
 
 

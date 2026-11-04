@@ -28,17 +28,20 @@ export HEXPROF_DOWNLOAD_DIR=${HEXPROF_DOWNLOAD_DIR:-/capstor/scratch/cscs/${USER
 
 cd "${HEXPROF_REPO:-${HOME}/repos/hexprof}" || exit 1
 RUNS=${HEXPROF_DOWNLOAD_DIR}/runs
+# Same QAIRT as the deployment being compared (qai_hub_models pins 2.50 for its exports); override with HEXPROF_QAIRT
+QAIRT=${HEXPROF_QAIRT:-2.50}
 echo "HEXPROF_DOWNLOAD_DIR: ${HEXPROF_DOWNLOAD_DIR}"
+echo "QAIRT:                ${QAIRT}"
 echo "hexprof commit:       $(git log -1 --oneline)"
 
 echo "================ compute ceiling ================"
 srun -u hexprof ceilings compute --precisions w8a16 w4a16 fp16 --size 2048 --chain 1 2 4 8 16 \
-    --out "${RUNS}/ceil-compute"
+    --qairt-version "${QAIRT}" --out "${RUNS}/ceil-compute"
 compute_status=$?
 
 echo "================ bandwidth ceiling ================"
 srun -u hexprof ceilings bandwidth --precision w4a16 --widths 3072 4096 5120 6144 --width-layers 16 \
-    --out "${RUNS}/ceil-bandwidth"
+    --qairt-version "${QAIRT}" --out "${RUNS}/ceil-bandwidth"
 bandwidth_status=$?
 
 echo "Finished on: $(date) (compute exit ${compute_status}, bandwidth exit ${bandwidth_status})"
