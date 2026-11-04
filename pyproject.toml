@@ -15,6 +15,7 @@ dependencies = [
     "pillow>=10",
     "onnx>=1.16,<1.19",
     "qai-hub>=0.56",
+    "ijson>=3.2",
 ]
 
 [project.optional-dependencies]

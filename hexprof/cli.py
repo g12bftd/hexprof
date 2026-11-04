@@ -124,6 +124,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"[{'ok' if good else ('--' if optional else '!!')}] {name}: {detail}")
 
     for mod, why, optional in [("qai_hub", "AI Hub jobs", False), ("onnx", "ceiling graphs", False),
+                               ("ijson", "streaming large QHAS / optrace files (hw report)", True),
                                ("qai_hub_models_cli", "fetch AI Hub assets", True),
                                ("transformers", "SigLIP 2 zero-shot labels / Gemma 4 dims", True),
                                ("matplotlib", "plots", True)]:
@@ -353,6 +354,19 @@ def cmd_hw_classify(args: argparse.Namespace) -> int:
         print(markdown_table(["op", "type", "time us", "HMX", "HVX", "GB/s", "class"],
                              [[r["name"][:48], r.get("op_type"), r.get("time_us"), r.get("hmx_util"), r.get("hvx_util"),
                                r.get("achieved_gbps"), r["bound"]] for r in top], 2))
+    return 0
+
+
+def cmd_hw_report(args: argparse.Namespace) -> int:
+    from hexprof.hwreport import report
+
+    paths = args.paths
+    if not paths:
+        from hexprof.models import gemma4_aihub
+
+        paths = [str(gemma4_aihub.default_export_dir())]
+    out = args.out or str(Path(paths[0] if Path(paths[0]).is_dir() else Path(paths[0]).parent) / "hw_report")
+    report.build(paths, out, top=args.top, bins=args.bins, title=args.title)
     return 0
 
 
@@ -588,6 +602,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("files", nargs="+")
     p.add_argument("--max-chars", type=int, default=20000)
     p.set_defaults(func=cmd_hw_fields)
+    p = w.add_parser("report", help="HTML report (charts + tables + CSV) from QHAS / optrace / AI Hub profile files")
+    p.add_argument("paths", nargs="*", help="folders or files to scan (default: the Gemma 4 export dir)")
+    p.add_argument("--out", help="output folder (default: <first path>/hw_report)")
+    p.add_argument("--top", type=int, default=15, help="rows per ranked chart (rest folded into Other)")
+    p.add_argument("--bins", type=int, default=400, help="time bins for the occupancy timelines")
+    p.add_argument("--title", help="overview page title")
+    p.set_defaults(func=cmd_hw_report)
     p = w.add_parser("classify", help="compute- / memory-bound / overhead per operator")
     p.add_argument("--job", help="AI Hub profile job id (downloads profile + artifacts)")
     p.add_argument("--trace", action="append", help="optrace / QHAS JSON file(s)")

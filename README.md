@@ -14,7 +14,8 @@ The package implements the plan in *"Gemma 4 on the Galaxy S25: results, hardwar
 | Compute ceiling: `latency = t0 + ops / P` per precision | `hexprof ceilings compute` |
 | Bandwidth ceiling: `latency = t0 + bytes / B`, width and depth sweeps | `hexprof ceilings bandwidth` |
 | Empty vs. full KV cache check | `hexprof ceilings kv-check` |
-| Hardware metrics: optrace / QHAS, per-op compute-, memory-bound or overhead | `hexprof hw fields` / `hw classify` |
+| Hardware metrics report: QHAS (QNN ops, HTP ops, HMX/HVX, DRAM/VTCM, critical path), optrace timelines, AI Hub per-layer, as HTML + CSV | `hexprof hw report` |
+| Per-op compute-, memory-bound or overhead | `hexprof hw classify` |
 | Pipeline: fine-tuned Gemma 4 → QNN context binaries → profile on the S25 | `hexprof pipeline gemma4 quantize` / `export` |
 
 ## How each model reaches the NPU
@@ -277,22 +278,72 @@ hexprof ceilings kv-check --precision w4a16 --layers 4 --context 4096
   `--dry-run` only builds the ONNX graphs. Weights stream to disk, so a 2 GB graph needs about
   200 MB of RAM.
 
-## Hardware metrics (optrace / QHAS)
+## Hardware metrics report (QHAS + optrace)
+
+AI Hub attaches two files to every NPU profile job, and hexprof downloads them next to the profile:
+the **QHAS** (QNN HTP Analysis Summary, `<job>_main_qhas_summary.json`) and the **optrace**
+(`<job>_main_profile_trace.json`). They hold what Workbench shows in its QHAS and trace views, and they
+are far too large to read by hand (hundreds of MB per Gemma 4 part, GBs for a vision encoder).
+`hexprof hw report` turns them into self-contained HTML pages with charts, plus CSV tables:
 
 ```bash
-hexprof hw fields runs/siglip2-profile-*/image_encoder/qhas/*.json
+hexprof hw report $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export
 ```
+
+```bash
+hexprof hw report $HEXPROF_DOWNLOAD_DIR/runs/siglip2-profile-<jobid>
+```
+
+It scans the folders for QHAS / optrace files, groups them by graph (`hw/<part>__<graph>/` for a Gemma 4
+export, `<component>/` for a SigLIP 2 run), attaches AI Hub's `<graph>.profile.json`, and writes
+`hw_report/` (default: inside the first folder given):
+
+* `index.html`: every graph side by side. Run time, HTP utilization, inferences per second, DRAM/VTCM
+  bytes and average GB/s, and where the cycles go (HMX / HVX / DMA / sync / reference ops / format changes).
+* `<graph>.html`, one page per graph:
+  * **Overall summary per HTP core**: Qualcomm's "% of overall timeline HTP utilization", inferences per
+    second, time, timeline cycles, DRAM and VTCM read/write.
+  * **Resource utilization**: HMX and HVX per HTP thread.
+  * **HTP op instances by unit**: share of all op cycles.
+  * **QNN op types and nodes**: cycles, % active cycles, HTP ops, DRAM/VTCM traffic, % on the critical path.
+  * **HTP op types**: reference ops (scalar code) and format changes flagged.
+  * **Critical (dominant) path ops** and the **slowest HTP op instances**, with time and DRAM GB/s.
+  * **QHAS timeline**: occupancy of each HTP thread.
+  * **Optrace**: busy share and timeline per thread, counter tracks such as memory bandwidth over time,
+    and time by op name.
+  * **AI Hub per-layer profile**: slowest layers and compute unit.
+* `<graph>/*.csv`: every table, for your own plots; `summary.json`: headline numbers of every graph.
+
+Each chart has hover tooltips and a table view, and the pages work offline in light and dark mode.
+Open `index.html` in a browser; copy the whole `hw_report/` folder to view it elsewhere.
+
+The QHAS column names and their definitions (quoted on the pages) are Qualcomm's, as used by their
+QAIRT Visualizer (QHAS schema 1.x). Files are streamed (`ijson`), so memory stays flat. Parsing runs at
+about 50 s per GB of QHAS on one core, so run it on a compute node for multi-GB files. Derived values
+are labelled as derived:
+* **GB/s** = bytes ÷ time;
+* **effective clock** = timeline cycles ÷ time;
+* **unit shares**: each op instance is counted once, in the order HMX, HVX, reference op, format change,
+  DMA wait, sync, DMA.
+
+The "% utilization" Qualcomm reports is the share of the run the HTP was busy, not compute or bandwidth
+efficiency; for those, see `hexprof gemma4 efficiency` and the ceilings.
+
+### Per-op bound classification
 
 ```bash
 hexprof hw classify --job <profile_job_id> --bandwidth-json runs/ceil-bandwidth-*/bandwidth_ceiling.json
 ```
 
-AI Hub attaches optrace (`PROFILE_TRACE`) and the QNN HTP Analysis Summary (`QHAS_SUMMARY`) to NPU
-profile jobs. Qualcomm does not publish their JSON schemas, so `hw fields` lists the tables and fields
-actually present. `hw classify` labels each operator: compute-bound (HMX or HVX utilisation ≥ 0.6),
-memory-bound (DRAM traffic ≥ 0.7·B), overhead (both low), or unknown. `--field-map` remaps fields.
-AI Hub does **not** report power, energy, temperature, clock frequencies or stall counters, and
-hexprof does not invent them.
+`hw classify` labels each operator:
+* **compute-bound**: HMX or HVX utilisation ≥ 0.6;
+* **memory-bound**: DRAM traffic ≥ 0.7·B;
+* **overhead**: both low;
+* **unknown**.
+
+`--field-map` remaps fields, and `hexprof hw fields <file>` lists the tables and fields in a file. AI Hub
+does **not** report power, energy, temperature, clock frequencies or stall counters, and hexprof does not
+invent them.
 
 ## Pipeline: fine-tuned Gemma 4 → S25
 
@@ -332,7 +383,7 @@ The tests run without a phone or an AI Hub token. They cover:
 * every ceiling graph executed in onnxruntime (a full-size 6-layer Gemma-4-shaped decoder was also
   built and run from disk during development);
 * the fits;
-* optrace/QHAS parsing;
+* optrace/QHAS parsing and the HTML report, on synthetic files with Qualcomm's schema;
 * end-to-end Gemma 4 flows against a simulated phone, plus the real adb wrapper through a POSIX shell;
 * SigLIP 2 and sweep flows against a simulated AI Hub.
 
