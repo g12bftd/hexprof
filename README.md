@@ -371,6 +371,38 @@ w4/w8/a16/kv8 recipe. `export` then compiles, links and profiles every (part, gr
 collects the metrics plus optrace/QHAS for each, and builds the GenieX QAIRT bundle.
 `--context-length` is the shorter-KV-cache optimisation from the plan.
 
+## Slurm jobs (CSCS Alps / Daint)
+
+`slurm/` holds the three batch jobs for the hosted-S25 workflow:
+
+| Script | Runs | Results |
+|---|---|---|
+| `slurm/gemma4_profile.sh` | `hexprof gemma4 aihub --export-only`: compile Gemma 4 and profile every part | `$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/` |
+| `slurm/siglip2_profile.sh` | `hexprof siglip2 profile`: image and text encoders | `$HEXPROF_DOWNLOAD_DIR/runs/siglip2-profile-<jobid>/` |
+| `slurm/hw_report.sh` | `hexprof hw report` on both of the above | `…/hw_report/index.html` in each |
+
+```bash
+mkdir -p /capstor/scratch/cscs/$USER/job_logs/hexprof
+```
+
+```bash
+sbatch slurm/gemma4_profile.sh
+```
+
+```bash
+sbatch slurm/siglip2_profile.sh
+```
+
+```bash
+sbatch slurm/hw_report.sh
+```
+
+They assume a conda env `hexprof` under `~/miniforge3` and the repo at `~/repos/hexprof` (override
+with `HEXPROF_REPO`). `HEXPROF_DOWNLOAD_DIR` defaults to `/capstor/scratch/cscs/$USER/VLMs`. Logs go
+to `/capstor/scratch/cscs/$USER/job_logs/hexprof/`, which must exist before you submit. Override the
+project with `sbatch --account=<project> …`. To build the report automatically once both profiling
+jobs succeed, submit it with `--dependency=afterok:<gemma_jobid>:<siglip_jobid>`.
+
 ## Tests
 
 ```bash
