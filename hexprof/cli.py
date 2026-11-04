@@ -366,7 +366,21 @@ def cmd_hw_report(args: argparse.Namespace) -> int:
 
         paths = [str(gemma4_aihub.default_export_dir())]
     out = args.out or str(Path(paths[0] if Path(paths[0]).is_dir() else Path(paths[0]).parent) / "hw_report")
-    report.build(paths, out, top=args.top, bins=args.bins, title=args.title)
+    report.build(paths, out, top=args.top, bins=args.bins, title=args.title, compute_json=args.compute_json,
+                 bandwidth_json=args.bandwidth_json, theory_gbps=args.theoretical_gbps,
+                 precisions=_parse_map(args.precision), gemma_config=args.gemma_config, onnx=_parse_map(args.onnx))
+    return 0
+
+
+def cmd_hw_fetch_models(args: argparse.Namespace) -> int:
+    from hexprof.hwreport import models
+
+    paths = args.paths
+    if not paths:
+        from hexprof.models import gemma4_aihub
+
+        paths = [str(gemma4_aihub.default_export_dir())]
+    models.fetch(paths, onnx=args.onnx, max_onnx_gb=args.max_onnx_gb, refresh=args.refresh)
     return 0
 
 
@@ -608,7 +622,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=15, help="rows per ranked chart (rest folded into Other)")
     p.add_argument("--bins", type=int, default=400, help="time bins for the occupancy timelines")
     p.add_argument("--title", help="overview page title")
+    p.add_argument("--compute-json", help="compute_ceiling.json from `hexprof ceilings compute` (P per precision)")
+    p.add_argument("--bandwidth-json", help="bandwidth_ceiling.json from `hexprof ceilings bandwidth` (B)")
+    p.add_argument("--theoretical-gbps", type=float, default=84.8,
+                   help="theoretical DRAM bandwidth (default: S25, LPDDR5X-5300 x 64-bit)")
+    p.add_argument("--precision", nargs="*", help="override a graph's precision, e.g. image_encoder=w8a16")
+    p.add_argument("--gemma-config", help="Gemma 4 config.json (default: the one the export downloaded)")
+    p.add_argument("--onnx", nargs="*", help="ONNX for per-op MACs, e.g. vision_encoder__gemma_4_e4b_it=/path/model.onnx "
+                                             "(default: the ones `hw fetch-models --onnx` downloaded)")
     p.set_defaults(func=cmd_hw_report)
+    p = w.add_parser("fetch-models", help="record each profiled graph's compiled size, parameters and source ONNX "
+                                          "from AI Hub (for the report's weight bytes and MAC counts)")
+    p.add_argument("paths", nargs="*", help="result folders (default: the Gemma 4 export dir)")
+    p.add_argument("--onnx", choices=["none", "vision", "all"], default="none",
+                   help="also download source ONNX models: vision = only the vision encoder; all = every graph "
+                        "(the Gemma 4 text parts are several GB each)")
+    p.add_argument("--max-onnx-gb", type=float, default=20.0, help="skip source models larger than this")
+    p.add_argument("--refresh", action="store_true", help="ignore cached models/*.model.json")
+    p.set_defaults(func=cmd_hw_fetch_models)
     p = w.add_parser("classify", help="compute- / memory-bound / overhead per operator")
     p.add_argument("--job", help="AI Hub profile job id (downloads profile + artifacts)")
     p.add_argument("--trace", action="append", help="optrace / QHAS JSON file(s)")

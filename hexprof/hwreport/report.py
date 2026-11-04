@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from hexprof.aihub.metrics import aihub_metrics
+from hexprof.hwreport import efficiency as EF
 from hexprof.hwreport import html as H
+from hexprof.hwreport import models as MD
 from hexprof.hwreport import optrace as OT
 from hexprof.hwreport import qhas as QH
 from hexprof.io_utils import _jsonable, write_json
@@ -57,6 +59,8 @@ class Graph:
     optrace: Path | None = None
     profile: Path | None = None
     published: dict[str, Any] | None = None  # AI Hub's published figures for this component, when known
+    precision: str | None = None  # recorded by the run (SigLIP 2 profile.json), else inferred
+    info: dict[str, Any] | None = None  # AI Hub model facts from `hexprof hw fetch-models`
     out: dict[str, Any] = field(default_factory=dict)
 
 
@@ -85,6 +89,8 @@ def discover(paths: Sequence[str | Path]) -> list[Graph]:
                 d = None
             comps = d.get("components") if isinstance(d, dict) else None
             for comp, rec in (comps or {}).items():
+                if comp in graphs and isinstance(d, dict) and d.get("precision"):
+                    graphs[comp].precision = str(d["precision"])
                 if comp in graphs and isinstance(rec, dict) and rec.get("published"):
                     graphs[comp].published = {**rec["published"], "what": f"{d.get('precision')}, {d.get('runtime')}"}
     for g in graphs.values():
@@ -166,7 +172,7 @@ def _mb(r: Any) -> str:
 
 def _fmt_bytes(v: Any) -> str:
     v = _n(v)
-    for unit, d in (("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
+    for unit, d in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):  # decimal, consistent with GB/s
         if abs(v) >= d:
             return f"{v / d:.1f} {unit}"
     return f"{v:.0f} B"
@@ -183,7 +189,8 @@ def _fmt_n(v: Any) -> str:
 # --------------------------------------------------------------------------- per graph
 
 
-def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
+def graph_page(g: Graph, out_dir: Path, top: int, bins: int, ctx: EF.Ctx | None = None) -> dict[str, Any]:
+    ctx = ctx or EF.Ctx()
     csv_dir = out_dir / g.label
     sections: list[dict[str, Any]] = []
     tiles: list[dict[str, Any]] = []
@@ -381,6 +388,30 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                                                       ["DRAM GB/s", f"{r['dram_gbps']:.1f}" if r.get("dram_gbps") is not None else "–"]]}
                                            for r in slow[:top]],
                                   "table": {"cols": _instance_cols(), "rows": slow}}]})
+        # ---- efficiency, roofline and stalls (placed right after the overall summary)
+        prec = EF.precision_of(g.label, g.precision, ctx)
+        onnx = ctx.onnx.get(g.label) or (g.info or {}).get("onnx_path")
+        eff = EF.graph_metrics(g.label, k, inst, rep.qnn_op_types, rep.qnn_op_instances, prec, g.info, onnx, ctx,
+                               rep.resources)
+        warnings += eff.pop("warnings", [])
+        summary["efficiency"] = {kk: vv for kk, vv in eff.items() if kk != "per_op"}
+        if eff.get("per_op"):
+            summary["efficiency"]["per_op_coverage_pct"] = eff["per_op"]["coverage_pct"]
+            _csv(csv_dir / "per_op_roofline.csv", eff["per_op"]["rows"])
+        _csv(csv_dir / "efficiency.csv", [{kk: vv for kk, vv in eff.items() if not isinstance(vv, (dict, list))}])
+        _csv(csv_dir / "waiting_by_qnn_op_type.csv", (eff.get("stalls") or {}).get("waiting_by_type") or [])
+        pos = next((i + 1 for i, sec in enumerate(sections) if sec["title"] == "Overall summary per HTP core"), len(sections))
+        sections[pos:pos] = EF.graph_sections(eff, top, ctx)
+        if eff.get("achieved_tops") is not None:
+            tiles.append({"label": "Achieved compute", "value": f"{eff['achieved_tops']:.2f} TOPS",
+                          "sub": (f"{eff['compute_util_pct']:.1f}% of P ({prec})" if eff.get("compute_util_pct") is not None
+                                  else "P not measured yet")})
+        if eff.get("dram_gbps") is not None:
+            tiles.append({"label": "Bandwidth utilization",
+                          "value": f"{eff['bw_util_pct']:.1f}%" if eff.get("bw_util_pct") is not None
+                          else f"{eff['bw_util_theory_pct']:.1f}%",
+                          "sub": f"of measured B ({ctx.B:.1f} GB/s)" if eff.get("bw_util_pct") is not None
+                          else f"of the theoretical {ctx.theory_gbps:g} GB/s"})
         if inst.get("timeline"):
             sections.append({"title": "QHAS timeline: HTP thread occupancy", "why": QHAS_DEFS["timeline"],
                              "blocks": [{"type": "lanes", "timeline": inst["timeline"], "title": "HTP thread occupancy",
@@ -475,8 +506,10 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                       "sub": (f"published {pub['inference_time_milliseconds']} ms" if pub.get("inference_time_milliseconds")
                               else ", ".join(f"{k.upper()} {v}" for k, v in lc.items() if k != "total" and v) + " layers")})
         if pk:
-            tiles.append({"label": "AI Hub peak memory", "value": f"{pk.get('min')}–{pk.get('max')} MB",
-                          "sub": f"{lc.get('npu', 0)} of {lc.get('total', 0)} layers on the NPU"})
+            lp = m.get("first_load_peak_memory_range_mb") or {}
+            tiles.append({"label": "AI Hub inference peak memory", "value": f"{pk.get('min')}–{pk.get('max')} MB",
+                          "sub": (f"load peak {lp.get('max')} MB; " if lp else "")
+                                 + f"{lc.get('npu', 0)} of {lc.get('total', 0)} layers on the NPU"})
         rows_m = [{"metric": "Inference time", "value": _ms(m.get("inference_time_milliseconds")),
                    "published": _ms(pub.get("inference_time_milliseconds"))},
                   {"metric": "Peak memory (inference)", "value": _mb(pk), "published": _mb(pub.get("estimated_peak_memory_range_mb"))},
@@ -580,7 +613,7 @@ def _stack_block(rows: list[dict[str, Any]], series: list[str], title: str) -> d
                       "rows": [{"label": r["label"], **dict(zip(series, r["values"]))} for r in rows]}}
 
 
-def overview_page(graphs: list[Graph], title: str) -> dict[str, Any]:
+def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) -> dict[str, Any]:
     rows = []
     for g in graphs:
         k = g.out.get("qhas", {}).get("kpis", {})
@@ -592,6 +625,7 @@ def overview_page(graphs: list[Graph], title: str) -> dict[str, Any]:
                      "util": k.get("percent_utilization"), "ips": k.get("inf_per_s"), "dram": k.get("total_dram"),
                      "dram_gbps": k.get("dram_gbps"), "vtcm": k.get("total_vtcm"),
                      "aihub_ms": ah.get("inference_time_ms"), "peak_mb": pk.get("max"),
+                     "load_peak_mb": (ah.get("first_load_peak_memory_range_mb") or {}).get("max"),
                      "published_ms": (g.published or {}).get("inference_time_milliseconds"),
                      "trace_ms": ot["span_us"] / 1e3 if ot.get("span_us") else None})
     tiles: list[dict[str, Any]] = []
@@ -635,14 +669,20 @@ def overview_page(graphs: list[Graph], title: str) -> dict[str, Any]:
              {"key": "dram", "label": "DRAM", "kind": "bytes"},
              {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"},
              {"key": "vtcm", "label": "VTCM", "kind": "bytes"},
-             {"key": "peak_mb", "label": "Peak MB", "kind": "num"},
+             {"key": "peak_mb", "label": "Inference peak MB", "kind": "num"},
+             {"key": "load_peak_mb", "label": "Load peak MB", "kind": "num"},
              {"key": "trace_ms", "label": "Trace ms", "kind": "num"},
              {"key": "folder", "label": "Folder", "kind": "str"}]
+    ctx_ = ctx or EF.Ctx()
+    eff_secs = EF.overview_sections(graphs, short_label, ctx_)
     sections.append({"title": "Graphs", "why": "One row per compiled graph. Click a name for its full report.",
                      "blocks": [{"type": "note", "text": "AI Hub ms and peak memory: AI Hub's profile job (what Workbench "
-                                 "shows). QHAS ms, utilization, inferences per second and memory traffic: the QHAS file "
-                                 "of the detailed profiling run. Trace ms: optrace span, converted to ms.",
+                                 "shows). Inference peak = extra memory used while running (weights are allocated at "
+                                 "load time, so for large models see Load peak). QHAS ms, utilization, inferences per "
+                                 "second and memory traffic: the QHAS file of the detailed profiling run. Trace ms: "
+                                 "optrace span, converted to ms. Bytes are decimal (1 GB = 10⁹ B), like GB/s.",
                                  "table": {"open": True, "cols": cols, "rows": rows}}]})
+    sections += eff_secs
     for key, title_, kind, why in (("aihub_ms", "Run time per graph (AI Hub, ms)", "num", "AI Hub's inference time of one run."),
                                    ("util", "HTP utilization per graph", "pct", QHAS_DEFS["util"]),
                                    ("dram_gbps", "Average DRAM bandwidth per graph (GB/s)", "num",
@@ -684,22 +724,40 @@ def overview_page(graphs: list[Graph], title: str) -> dict[str, Any]:
 
 
 def build(paths: Sequence[str | Path], out_dir: str | Path, top: int = 15, bins: int = 400,
-          title: str | None = None) -> Path:
+          title: str | None = None, compute_json: str | Path | None = None, bandwidth_json: str | Path | None = None,
+          theory_gbps: float = EF.THEORETICAL_GBPS, precisions: dict[str, str] | None = None,
+          gemma_config: str | None = None, onnx: dict[str, str] | None = None) -> Path:
+    from hexprof.ceilings.experiments import load_ceilings
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     graphs = discover(paths)
     if not graphs:
         raise FileNotFoundError("no QHAS (*qhas*.json) or optrace (*profile_trace*.json) files found under "
                                 + ", ".join(map(str, paths)))
+    ceil = load_ceilings(compute_json, bandwidth_json)
+    ctx = EF.Ctx(P={k: v for k, v in (ceil.get("P_tops") or {}).items() if v}, B=ceil.get("B_gbps"),
+                 B_series=ceil.get("B_series"), theory_gbps=theory_gbps, precisions=precisions or {},
+                 gemma_config=gemma_config, onnx=onnx or {},
+                 ceilings_src={"compute": str(compute_json or ""), "bandwidth": str(bandwidth_json or "")})
+    print("Ceilings: " + (", ".join(f"P[{k}] = {v:.2f} TOPS" for k, v in ctx.P.items()) or "no P")
+          + "; " + (f"B = {ctx.B:.1f} GB/s ({ctx.B_series})" if ctx.B else f"no B (theoretical {theory_gbps:g} GB/s used)"))
+    infos = MD.load_infos([Path(p) if Path(p).is_dir() else Path(p).parent for p in paths])
+    for g in graphs:
+        g.info = infos.get(g.label)
+    if infos:
+        print(f"AI Hub model facts for {sum(1 for g in graphs if g.info)} of {len(graphs)} graphs")
     for i, g in enumerate(graphs, 1):
         t = time.time()
         print(f"[{i}/{len(graphs)}] {g.label}: " + ", ".join(f"{p.name} ({_size(p)})" for p in (g.qhas, g.optrace, g.profile) if p),
               flush=True)
-        page = graph_page(g, out, top, bins)
+        page = graph_page(g, out, top, bins, ctx)
         (out / f"{g.label}.html").write_text(H.render_page(_jsonable(page)), encoding="utf-8")
         print(f"    done in {time.time() - t:.1f} s", flush=True)
-    ov = overview_page(graphs, title or "NPU hardware report")
+    ov = overview_page(graphs, title or "NPU hardware report", ctx)
     (out / "index.html").write_text(H.render_page(_jsonable(ov)), encoding="utf-8")
-    write_json(out / "summary.json", {g.label: g.out for g in graphs})
+    write_json(out / "summary.json", {"_ceilings": {"P_tops": ctx.P, "B_gbps": ctx.B, "B_series": ctx.B_series,
+                                                    "theoretical_gbps": theory_gbps, **ctx.ceilings_src},
+                                      **{g.label: g.out for g in graphs}})
     print(f"\nReport: {out / 'index.html'}  ({len(graphs)} graph pages, CSV tables per graph, summary.json)")
     return out / "index.html"

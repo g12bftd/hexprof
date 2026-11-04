@@ -120,9 +120,9 @@ const F = {
     if (a >= 1e9) return (v/1e9).toFixed(d ?? 2) + "G"; if (a >= 1e6) return (v/1e6).toFixed(d ?? 2) + "M";
     if (a >= 1e4) return (v/1e3).toFixed(d ?? 1) + "K"; if (a >= 100) return v.toFixed(0); if (a >= 1) return v.toFixed(d ?? 2);
     return v.toPrecision(3); },
-  bytes(v) { if (v == null || isNaN(v)) return "–"; const a = Math.abs(v);
-    if (a >= 1073741824) return (v/1073741824).toFixed(2) + " GiB"; if (a >= 1048576) return (v/1048576).toFixed(1) + " MiB";
-    if (a >= 1024) return (v/1024).toFixed(1) + " KiB"; return v.toFixed(0) + " B"; },
+  bytes(v) { if (v == null || isNaN(v)) return "–"; const a = Math.abs(v);  // decimal, like GB/s
+    if (a >= 1e9) return (v/1e9).toFixed(2) + " GB"; if (a >= 1e6) return (v/1e6).toFixed(1) + " MB";
+    if (a >= 1e3) return (v/1e3).toFixed(1) + " kB"; return v.toFixed(0) + " B"; },
   pct(v) { return v == null || isNaN(v) ? "–" : v.toFixed(1) + "%"; },
   frac(v) { return v == null || isNaN(v) ? "–" : (100 * v).toFixed(1) + "%"; },
   us(v) { if (v == null || isNaN(v)) return "–"; if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(2) + " ms"; return v.toFixed(1) + " µs"; },
@@ -293,6 +293,43 @@ function lanes(parent, tl, o) {
   return box;
 }
 
+// ---- roofline: log-log scatter of achieved TOPS vs ops per DRAM byte, under the memory and compute roofs ----------
+function roofline(parent, o) {
+  const pts = (o.points || []).filter(p => p.x > 0 && p.y > 0);
+  if (!pts.length) { txt("p", "No points with both work and DRAM bytes.", parent, "note"); return; }
+  const groups = o.groups && o.groups.length ? o.groups : ["ops"], gi = g => Math.max(0, groups.indexOf(g));
+  const P = o.P || {}, Pv = Object.entries(P).filter(([, v]) => v > 0), Bm = o.B, Bt = o.Bth, Bref = Bm || Bt;
+  const lg = el("div", {class: "legend"}, parent);
+  groups.forEach((g, i) => { const sp = el("span", {}, lg); const sw = el("i", {}, sp); sw.style.background = SLOTS[i % 8]; sw.style.borderRadius = "50%"; txt("span", g, sp); });
+  if (Bm) { const sp = el("span", {}, lg); const sw = el("i", {}, sp); sw.style.background = "var(--text-secondary)"; sw.style.height = "2px"; txt("span", "measured B " + Bm.toFixed(1) + " GB/s", sp); }
+  if (Bt) { const sp = el("span", {}, lg); const sw = el("i", {}, sp); sw.style.background = "var(--muted)"; sw.style.height = "2px"; txt("span", "theoretical " + Bt + " GB/s (dashed)", sp); }
+  const W = chartW(parent), H = 360, L = 64, R = 96, T = 12, Bo = 40;
+  const xsAll = pts.map(p => p.x).concat(Pv.map(([, v]) => v * 1e3 / Bref)), ysAll = pts.map(p => p.y).concat(Pv.map(([, v]) => v));
+  const lx0 = Math.floor(Math.log10(Math.min(...xsAll)) - 0.3), lx1 = Math.ceil(Math.log10(Math.max(...xsAll)) + 0.3);
+  const ly0 = Math.floor(Math.log10(Math.min(...ysAll)) - 0.3), ly1 = Math.ceil(Math.log10(Math.max(...ysAll)) + 0.3);
+  const X = v => L + (W - L - R) * (Math.log10(v) - lx0) / (lx1 - lx0), Y = v => T + (H - T - Bo) * (1 - (Math.log10(v) - ly0) / (ly1 - ly0));
+  const box = el("div", {class: "chart"}, parent), s = sv("svg", {width: W, height: H, role: "img", "aria-label": o.title || "roofline"}, box);
+  const dec = v => v >= 1e3 ? (v / 1e3) + "k" : String(+v.toPrecision(1));
+  for (let e = lx0; e <= lx1; e++) { sv("line", {x1: X(10 ** e), x2: X(10 ** e), y1: T, y2: H - Bo, class: "grid"}, s);
+    sv("text", {x: X(10 ** e), y: H - Bo + 16, "text-anchor": X(10 ** e) > W - R - 20 ? "end" : "middle", class: "axis"}, s).textContent = dec(10 ** e); }
+  for (let e = ly0; e <= ly1; e++) { sv("line", {x1: L, x2: W - R, y1: Y(10 ** e), y2: Y(10 ** e), class: "grid"}, s);
+    sv("text", {x: L - 6, y: Y(10 ** e) + 4, "text-anchor": "end", class: "axis"}, s).textContent = dec(10 ** e); }
+  sv("text", {x: (L + W - R) / 2, y: H - 4, "text-anchor": "middle", class: "axis"}, s).textContent = "arithmetic intensity (ops per DRAM byte)";
+  sv("text", {x: 12, y: (T + H - Bo) / 2, "text-anchor": "middle", class: "axis", transform: `rotate(-90 12 ${(T + H - Bo) / 2})`}, s).textContent = "achieved TOPS";
+  const xa = 10 ** lx0, xb = 10 ** lx1, yTop = 10 ** ly1;
+  const memRoof = (B, dash, cls) => { if (!B) return; const x2 = Math.min(xb, yTop * 1e3 / B);
+    sv("line", {x1: X(xa), y1: Y(xa * B / 1e3), x2: X(x2), y2: Y(x2 * B / 1e3), stroke: cls, "stroke-width": 2, "stroke-dasharray": dash || "", "stroke-linecap": "round"}, s); };
+  memRoof(Bt, "5 4", "var(--muted)"); memRoof(Bm, "", "var(--text-secondary)");
+  Pv.forEach(([g, v]) => { const i = groups.indexOf(g), color = i >= 0 ? SLOTS[i % 8] : "var(--text-secondary)", xr = Math.max(xa, v * 1e3 / Bref);
+    sv("line", {x1: X(xr), y1: Y(v), x2: X(xb), y2: Y(v), stroke: color, "stroke-width": 2, "stroke-linecap": "round"}, s);
+    sv("text", {x: X(xb) + 6, y: Y(v) + 4, class: "val"}, s).textContent = "P " + g + " " + v.toFixed(1); });
+  pts.forEach(p => { const g = sv("g", {class: "mark"}, s), color = SLOTS[gi(p.group) % 8];
+    sv("circle", {cx: X(p.x), cy: Y(p.y), r: 5, fill: color, stroke: "var(--surface-1)", "stroke-width": 2}, g);
+    const hit = sv("circle", {cx: X(p.x), cy: Y(p.y), r: 10, class: "hit"}, g);
+    hover(hit, e => showTip(e, F.num(p.y) + " TOPS", p.label, [["group", p.group, color]].concat(p.extra || []))); });
+  return box;
+}
+
 // ---- page assembly --------------------------------------------------------------------------------------------
 function card(root, title, why) { const c = el("section", {class: "card"}, root); txt("h2", title, c); if (why) txt("p", why, c, "why"); return c; }
 function tiles(root, items) { const t = el("div", {class: "tiles"}, root);
@@ -310,6 +347,7 @@ function render(root, page) {
       else if (b.type === "stacked") stacked(c, b.rows, b.series, b);
       else if (b.type === "line") { if (b.subtitle) txt("p", b.subtitle, c, "note"); line(c, b.points, b); }
       else if (b.type === "lanes") lanes(c, b.timeline, b);
+      else if (b.type === "roofline") roofline(c, b);
       else if (b.type === "note" && b.text) txt("p", b.text, c, "note");
       if (b.table) tableView(c, b.table.cols, b.table.rows, b.table.open);
     }

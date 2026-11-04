@@ -137,6 +137,15 @@ class QhasReport:
         return None
 
 
+def load_overall(path: str | Path) -> QhasReport:
+    """Header + overall summary only (one streaming pass; for headline numbers)."""
+    path = str(path)
+    header = jsonstream.first(path, "header", {}) or {}
+    overall = [{k: _conv(k, v) for k, v in r.items() if k != "htp_resources"}
+               for r in jsonstream.items(path, "data.htp_overall_summary.data.item")]
+    return QhasReport(path, header, overall, [], [], [], [])
+
+
 def load(path: str | Path, top_n: int = 200, timeline_bins: int = 400) -> QhasReport:
     path = str(path)
     header = jsonstream.first(path, "header", {}) or {}

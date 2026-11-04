@@ -325,6 +325,37 @@ Optrace timestamps are not always in µs. The report finds their unit by matchin
 against the QHAS run of the same graph (in HTP cycles, µs or ns), converts to µs, and says which it
 used. If nothing matches, times stay in the file's own units, with a warning.
 
+**Efficiency and stalls** (overview and every graph page):
+
+| Metric | How it's computed |
+|---|---|
+| Work (MACs) | ONNX shapes of the compiled graph (`hw fetch-models --onnx`), else analytic: Gemma 4 text parts from Qualcomm's config and w4a16 recipe, SigLIP 2 from its config |
+| Achieved TOPS, % of P | 2 × MACs ÷ QHAS run time; P measured at the graph's precision by `hexprof ceilings compute` |
+| MACs per cycle | MACs ÷ timeline cycles (clock-independent) |
+| DRAM GB/s, % of B | QHAS DRAM bytes ÷ run time; B from `hexprof ceilings bandwidth`, plus % of the theoretical 84.8 GB/s |
+| Arithmetic intensity, roofline | 2 × MACs ÷ DRAM bytes; attainable = min(P, intensity × B); achieved ÷ attainable; memory- or compute-bound |
+| DRAM ÷ (weights + KV) | weights = AI Hub's compiled model size (`hw fetch-models`) or analytic; the rest is activations, I/O and spills |
+| Stalls | idle %; waiting inside ops (Qualcomm's % active cycles); DMA wait and sync as shares of work and of the critical path; data movement and graph I/O on the critical path; waiting cycles per QNN op type |
+| Parallelism | average busy threads, busy HVX threads, HMX ops in flight, Qualcomm's per-thread HMX / HVX utilization |
+| Per-op roofline | ONNX MACs joined onto QHAS QNN nodes by name: per-op TOPS, intensity and % of roofline |
+
+A result above its roof is flagged: it means P, B or the MAC count is inconsistent. AI Hub does not
+expose hardware stall counters, clocks or power; the report says so instead of estimating them.
+
+```bash
+hexprof hw fetch-models $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export --onnx vision
+```
+
+```bash
+hexprof hw report $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export \
+    --compute-json $HEXPROF_DOWNLOAD_DIR/runs/ceil-compute/compute_ceiling.json \
+    --bandwidth-json $HEXPROF_DOWNLOAD_DIR/runs/ceil-bandwidth/bandwidth_ceiling.json
+```
+
+`hw fetch-models` (needs the AI Hub token) follows each profiled model back through its link and compile
+jobs and caches the compiled size, parameter count, input shapes and, with `--onnx`, the source ONNX in
+`<results>/models/`. `--onnx all` also fetches the Gemma 4 text parts (several GB each) for per-op MACs.
+
 Each chart has hover tooltips and a table view, and the pages work offline in light and dark mode.
 Open `index.html` in a browser; copy the whole `hw_report/` folder to view it elsewhere.
 
@@ -390,7 +421,8 @@ collects the metrics plus optrace/QHAS for each, and builds the GenieX QAIRT bun
 |---|---|---|
 | `slurm/gemma4_profile.sh` | `hexprof gemma4 aihub --export-only`: compile Gemma 4 and profile every part | `$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/` |
 | `slurm/siglip2_profile.sh` | `hexprof siglip2 profile`: image and text encoders | `$HEXPROF_DOWNLOAD_DIR/runs/siglip2-profile-<jobid>/` |
-| `slurm/hw_report.sh` | `hexprof hw report` on both of the above | `…/hw_report/index.html` in each |
+| `slurm/ceilings.sh` | `hexprof ceilings compute` (w8a16, w4a16, fp16) and `ceilings bandwidth` (w4a16); resumable | `$HEXPROF_DOWNLOAD_DIR/runs/ceil-compute/`, `runs/ceil-bandwidth/` |
+| `slurm/hw_report.sh` | `hexprof hw fetch-models` + `hexprof hw report` on both profiling results, with the ceilings when present | `…/hw_report/index.html` in each |
 
 ```bash
 mkdir -p /capstor/scratch/cscs/$USER/job_logs/hexprof
@@ -402,6 +434,10 @@ sbatch slurm/gemma4_profile.sh
 
 ```bash
 sbatch slurm/siglip2_profile.sh
+```
+
+```bash
+sbatch slurm/ceilings.sh
 ```
 
 ```bash

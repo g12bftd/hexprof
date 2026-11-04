@@ -205,4 +205,4 @@ def test_report_end_to_end_rollup_units_and_published(tmp_path):
     summ = next(s for s in page["sections"] if s["title"] == "AI Hub profile summary")
     trows = {r["metric"]: r for r in summ["blocks"][0]["table"]["rows"]}
     assert trows["Inference time"]["published"] == "3.319 ms" and trows["Warm load time"]["value"] == "120.000 ms"
-    assert any(t["label"] == "AI Hub peak memory" for t in page["tiles"])
+    assert any(t["label"] == "AI Hub inference peak memory" for t in page["tiles"])

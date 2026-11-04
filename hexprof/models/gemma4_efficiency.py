@@ -17,9 +17,12 @@ split at layers [0:24] [24:33] [33:42] + lm_head; sliding-window and global
 attention layers with their own head sizes; KV-shared layers without K/V
 projections and with a double-wide MLP; per-layer-embedding gate/projection.
 Deployed precision follows Qualcomm's w4a16 recipe: int4 transformer weights,
-int8 ``down_proj`` and ``lm_head``, int8 KV cache. Embedding lookups run on the
-host and are excluded. These are analytic estimates; ``--measure-binaries``
-downloads the compiled context binaries to cross-check the byte counts.
+int8 ``down_proj``, int4 ``lm_head`` (QHAS measures 344.5 MB of DRAM traffic
+for the lm_head token graph: 262144 x 2560 weights at 4 bits = 335.5 MB, at 8
+bits it would be 671 MB), int8 KV cache. Embedding lookups run on the host and
+are excluded. Byte counts are analytic estimates unless the graph's QHAS file
+is present: then the DRAM bytes it measured are used (``bytes_source``).
+``--measure-binaries`` downloads the compiled context binaries as a further check.
 
 With the measured ceilings (``hexprof ceilings compute/bandwidth``) it also
 reports compute / bandwidth utilisation and the roofline bound per part.
@@ -39,6 +42,7 @@ from hexprof.io_utils import markdown_table, read_json, write_json
 
 SPLITTING_POINTS = (24, 33)  # qai_hub_models gemma_4_e4b_it: layers[0:24] | [24:33] | [33:42] | lm_head
 SCALE_BYTES_PER_CHANNEL = 4  # fp32 per-output-channel scale
+LM_HEAD_BITS = 4  # measured: the lm_head token graph moves 344.5 MB per run (4-bit = 335.5 MB, 8-bit = 671 MB)
 _GRAPH_RE = re.compile(r"(prompt|token)_ar(\d+)_cl(\d+)_(\d+)_of_(\d+)")
 _PART_RE = re.compile(r"part(\d+)_of_(\d+)")
 
@@ -150,7 +154,7 @@ def part_counts(c: TextConfig, part: int, num_parts: int, seq: int, ctx: int,
                 splits: tuple[int, ...] | None = None) -> dict[str, float]:
     bounds = [0, *splits_for(c, num_parts, splits), c.layers]
     if part == num_parts and len(bounds) - 1 < num_parts:  # last part = lm_head
-        p, b = _linear(c.hidden, c.vocab, 8)
+        p, b = _linear(c.hidden, c.vocab, LM_HEAD_BITS)
         return {"layers": "lm_head", "params": p, "weight_bytes": b, "ops": 2 * p * seq, "kv_bytes": 0.0}
     lo, hi = bounds[part - 1], bounds[part]
     tot = {"params": 0.0, "weight_bytes": 0.0, "ops": 0.0, "kv_bytes": 0.0}
@@ -267,8 +271,12 @@ def efficiency(
             row.update(kind="prefill" if kind == "prompt" else "decode", tokens=seq, context=ctx, layers=cnt["layers"],
                        weight_params=cnt["params"], weight_bytes=cnt["weight_bytes"], kv_bytes=cnt["kv_bytes"],
                        ops=cnt["ops"])
-            total_bytes = cnt["weight_bytes"] + cnt["kv_bytes"]
+            est_bytes = cnt["weight_bytes"] + cnt["kv_bytes"]
+            measured = _measured_dram(export_dir, label)
+            total_bytes = measured or est_bytes
+            row["bytes_estimate"] = est_bytes
             row["bytes"] = total_bytes
+            row["bytes_source"] = "QHAS" if measured else "estimate"
             row["achieved_tops"] = cnt["ops"] / (t_ms / 1e3) / 1e12
             row["achieved_gbps"] = total_bytes / (t_ms / 1e3) / 1e9
             row["intensity_ops_per_byte"] = cnt["ops"] / total_bytes
@@ -320,6 +328,26 @@ def efficiency(
     return report
 
 
+def _measured_dram(export_dir: Path, label: str) -> float | None:
+    """DRAM bytes per run that QHAS measured for this graph (hw report summary first, else the QHAS file)."""
+    stem = label.replace("/", "__")
+    summ = export_dir / "hw_report" / "summary.json"
+    if summ.exists():
+        k = (read_json(summ).get(stem) or {}).get("qhas", {}).get("kpis") or {}
+        if k.get("total_dram"):
+            return float(k["total_dram"])
+    files = sorted(glob.glob(str(export_dir / "hw" / stem / "qhas" / "*.json")))
+    if not files:
+        return None
+    try:
+        from hexprof.hwreport import qhas as QH
+
+        k = QH.overall_kpis(QH.load_overall(files[0]))
+        return float(k["total_dram"]) if k.get("total_dram") else None
+    except Exception:  # noqa: BLE001 - not a QHAS 1.x file: fall back to the estimate
+        return None
+
+
 def _binary_sizes(summary: dict[str, Any], out: Path) -> dict[str, float]:
     """Download each component's compiled context binary once and return its size."""
     from hexprof.aihub import client as hc
@@ -355,7 +383,8 @@ def efficiency_markdown(r: dict[str, Any]) -> str:
     for g in r["graphs"]:
         row = [g["graph"], g["time_ms"], g["inferences_per_s"]]
         if "ops" in g:
-            row += [g["ops"] / 1e9, _gb(g["bytes"]), g["intensity_ops_per_byte"], g["achieved_tops"], g["achieved_gbps"]]
+            row += [g["ops"] / 1e9, _gb(g["bytes"]) + ("" if g.get("bytes_source") == "QHAS" else " (est.)"),
+                    g["intensity_ops_per_byte"], g["achieved_tops"], g["achieved_gbps"]]
         else:
             row += ["-", _gb(g.get("binary_bytes")), "-", "-", g.get("binary_gbps", "-")]
         if P:
@@ -384,6 +413,7 @@ def efficiency_markdown(r: dict[str, Any]) -> str:
         lines += ["", "Compiled binary sizes (both graphs of a part share one binary and its weights): "
                   + ", ".join(sorted({f"{g['graph'].split('/')[0]} {_gb(g['binary_bytes'])} GB"
                                       for g in r["graphs"] if 'binary_bytes' in g}))]
-    lines += ["", "GOP and GB read are analytic estimates from the model config and Qualcomm's w4a16 recipe "
-              "(int4 weights, int8 down_proj / lm_head / KV cache; host-side embedding lookups excluded)."]
+    lines += ["", "GOP is an analytic estimate from the model config and Qualcomm's w4a16 recipe (int4 weights and "
+              "lm_head, int8 down_proj and KV cache; host-side embedding lookups excluded). GB read is what QHAS "
+              "measured for the graph; (est.) marks the analytic estimate, used when no QHAS file is present."]
     return "\n".join(lines)
