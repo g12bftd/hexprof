@@ -393,6 +393,7 @@ STUDY_FIXED = {  # fixed setting -> (targets it applies to, the axis it would co
     "qairt": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, "qairt"),
     "batch": ({"siglip2-image", "siglip2-text"}, "batch"), "image_size": ({"gemma4-vision"}, "image-size"),
     "calibration_samples": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, None),
+    "override": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, None),
 }
 
 
@@ -432,6 +433,13 @@ def cmd_study_compare(args: argparse.Namespace) -> int:
 
     dc, db = S.default_ceilings()
     C.compare(args.study_dir, args.compute_json or dc, args.bandwidth_json or db, rebuild=args.rebuild)
+    return 0
+
+
+def cmd_study_summary(args: argparse.Namespace) -> int:
+    from hexprof.study import summary
+
+    summary.summarize(args.studies_dir)
     return 0
 
 
@@ -749,6 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--batch", type=int, help="SigLIP 2 batch size when not swept")
     g.add_argument("--image-size", type=int, help="vision encoder input size when not swept (Qualcomm: 448)")
     g.add_argument("--calibration-samples", type=int, help="quantize-job calibration samples (default: Qualcomm's)")
+    g.add_argument("--override", choices=["int16", "fp16"],
+                   help="mixed-precision axis: dtype of the layers kept at higher precision (default fp16)")
     p.set_defaults(func=cmd_study_run)
     p = st.add_parser("verify", help="re-check every profiled value of a study against AI Hub")
     p.add_argument("study_dir")
@@ -759,6 +769,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bandwidth-json")
     p.add_argument("--rebuild", action="store_true", help="rebuild every variant's hardware report")
     p.set_defaults(func=cmd_study_compare)
+    p = st.add_parser("summary", help="ablation summary: every verified change against Qualcomm's setting")
+    p.add_argument("studies_dir", nargs="?", help="default: $HEXPROF_DOWNLOAD_DIR/studies")
+    p.set_defaults(func=cmd_study_summary)
 
     # ---- ceilings
     c = sub.add_parser("ceilings", help="measure NPU compute / bandwidth ceilings on AI Hub").add_subparsers(dest="sub", required=True)

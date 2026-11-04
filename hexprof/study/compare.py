@@ -18,7 +18,8 @@ from hexprof.study import core
 GRAPH = re.compile(r"part_?(\d+)_of_(\d+)__(prompt|token)_ar(\d+)_cl(\d+)")
 AXIS_LABEL = {"context-length": "context length (tokens)", "prompt-length": "prompt chunk (tokens)",
               "decode-tokens": "tokens per decode step", "image-size": "image size (px)", "batch": "batch size",
-              "precision": "precision", "qairt": "QAIRT version"}
+              "precision": "precision", "qairt": "QAIRT version",
+              "mixed-precision": "% of layers kept at higher precision"}
 
 
 def _n(v: Any) -> float | None:

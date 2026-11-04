@@ -10,6 +10,8 @@ Axes
     image-size  (gemma4-vision)  VisionEncoder.from_pretrained(image_size=V)
     batch       (siglip2-*)      get_input_spec(image_batch_size=V / text_batch_size=V)
     precision   (all)            float | w8a16 | w8a8 | w4a16 ... via an AI Hub quantize job
+    mixed-precision (all)        Workbench Lite-MP: V% most sensitive layers kept at --override
+                                 (int16 / fp16), the rest at the --precision base (w8a16 / w8a8)
     qairt       (all)            --qairt_version V on compile and profile (default, latest, 2.xx)
 
 Verification compares what AI Hub reports for the compiled model and the jobs (input shapes,
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +41,7 @@ BATCH_KW = {"siglip2-image": "image_batch_size", "siglip2-text": "text_batch_siz
 def settings(target: str, axis: str, value: str, fixed: dict[str, Any]) -> dict[str, Any]:
     _, _, component, default_prec = TARGETS[target]
     s: dict[str, Any] = {"component": component, "precision": fixed.get("precision") or default_prec,
-                         "qairt": fixed.get("qairt"), "from_kwargs": {}, "spec_kwargs": {}}
+                         "qairt": fixed.get("qairt"), "from_kwargs": {}, "spec_kwargs": {}, "litemp": None}
     if fixed.get("image_size") and target == "gemma4-vision":
         s["from_kwargs"]["image_size"] = int(fixed["image_size"])
     if fixed.get("batch") and target in BATCH_KW:
@@ -51,6 +54,14 @@ def settings(target: str, axis: str, value: str, fixed: dict[str, Any]) -> dict[
         s["precision"] = value
     elif axis == "qairt":
         s["qairt"] = value
+    elif axis == "mixed-precision":
+        base = fixed.get("precision") or "w8a16"
+        if base not in core.QUANTIZED:
+            raise ValueError(f"mixed precision needs a quantized base --precision (w8a16, w8a8, ...), not {base}")
+        pct = int(value)
+        override = fixed.get("override") or "fp16"
+        s["precision"] = f"{base}_mixed_{override}" if pct else base
+        s["litemp"] = {"percentage": pct, "override": override} if pct else None
     return s
 
 
@@ -97,6 +108,10 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
         onnx_job = _staged(state, state_path, "onnx_job",
                            lambda: run_compile(model, name, dev, TargetRuntime.ONNX, prec, source, spec))
         onnx_model = hc.target_model(onnx_job)
+
+        if s.get("litemp"):  # the percentage Qualcomm's quantize options read from the model
+            pct = s["litemp"]["percentage"]
+            model.get_hub_litemp_percentage = lambda _p, _pct=pct: _pct
 
         def quantize() -> Any:
             try:
@@ -169,11 +184,19 @@ def verify(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any]
         core.check(checks, "precision float: no quantize job", None, jobs.get("quantize_job"), not jobs.get("quantize_job"))
     else:
         q = hc.get_job(jobs["quantize_job"]) if jobs.get("quantize_job") else None
-        want = (s["precision"][1:].split("a")[0], s["precision"].split("a")[1])
+        mw = re.match(r"w(\d+)a(\d+)", s["precision"])
+        want = (mw.group(1), mw.group(2)) if mw else ("?", "?")
         got_w = str(getattr(q, "weights_dtype", "")).upper()
         got_a = str(getattr(q, "activations_dtype", "")).upper()
         core.check(checks, "quantize job dtypes", f"INT{want[0]} weights, INT{want[1]} activations", f"{got_w} / {got_a}",
                    q is not None and got_w.endswith(f"INT{want[0]}") and got_a.endswith(f"INT{want[1]}"))
+        opts = str(getattr(q, "options", "") or "")
+        lm = s.get("litemp")
+        if lm:
+            flag = f"--lite_mp percentage={lm['percentage']};override_qtype={lm['override']}"
+            core.check(checks, "mixed precision on the quantize job", flag, opts, flag in opts)
+        elif axis == "mixed-precision":
+            core.check(checks, "no mixed precision on the quantize job", "no --lite_mp", opts, "--lite_mp" not in opts)
         cm = getattr(cjob, "model", None)
         core.check(checks, "compile job consumed the quantized model", jobs.get("quantized_model_id"),
                    getattr(cm, "model_id", None), getattr(cm, "model_id", None) == jobs.get("quantized_model_id"))

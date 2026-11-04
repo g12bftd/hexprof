@@ -481,6 +481,7 @@ hexprof study list
 | `siglip2-image` / `siglip2-text` | `batch` | 1 2 4 8 (16) | Qualcomm's `get_input_spec(image_batch_size / text_batch_size=V)` |
 | `siglip2-image` / `siglip2-text` | `precision` | float w8a16 w8a8 w4a16 | Qualcomm's quantize stage (`run_quantize`) |
 | all single-graph targets | `qairt` | default latest | `--qairt_version V` on compile and profile (`hexprof hub frameworks` lists versions) |
+| all single-graph targets | `mixed-precision` | 0 5 10 25 50 | Workbench Lite-MP: V% most sensitive layers at `--override` (fp16 / int16), the rest at the `--precision` base (w8a16 / w8a8); 0 = base only |
 
 Qualcomm's shipped setting is always among the defaults, so every study has its reference point.
 
@@ -498,6 +499,20 @@ plus CSV / JSON. Settings that are not swept are flags too (`--context-length`, 
 `--precision`, `--qairt`, `--batch`, `--image-size`). They are recorded in `study.json`, and a study folder
 refuses to mix runs with different fixed settings. Re-running resumes; `hexprof study verify <dir>` re-checks
 against AI Hub.
+
+Ablation summary across all studies (each verified change against Qualcomm's setting, with the
+hardware metrics behind it):
+
+```bash
+hexprof study summary
+```
+
+Not available as studies:
+* **dropping the audio encoder.** Qualcomm's QAIRT deployment of Gemma 4 has no audio component (image +
+  text only), so there is nothing to remove on the device.
+* **2-bit weights or quantization-aware training on Workbench.** Workbench quantize jobs are post-training
+  only, with INT4 / INT8 / INT16. Qualcomm's Gemma 4 text recipe is AIMET-based and needs an x86 GPU machine.
+  Per-layer mixed precision on Workbench is Lite-MP, which is the `mixed-precision` axis.
 
 What the studies do not establish:
 * accuracy. Quantized variants are calibrated with Qualcomm's calibration data, or the model's sample inputs

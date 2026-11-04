@@ -167,7 +167,8 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
     class Precision:
         def __init__(self, name):
             self.name = name
-            w, a = (name[1:].split("a") if name != "float" else (None, None))
+            m = re.match(r"w(\d+)a(\d+)", name)
+            w, a = (m.group(1), m.group(2)) if m else (None, None)
             self.weights_type = f"QuantizeDtype.INT{w}" if w else None
             self.activations_type = f"QuantizeDtype.INT{a}" if a else None
 
@@ -198,8 +199,16 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
         def sample_inputs(self, spec):
             return {"input_ids": [0]}
 
-        def get_hub_quantize_options(self, prec):
-            return ""
+        def get_hub_litemp_percentage(self, prec):
+            return None
+
+        def get_hub_quantize_options(self, prec):  # as Qualcomm's build_quantize_options
+            if "_mixed_" in prec.name:
+                pct = self.get_hub_litemp_percentage(prec)
+                if pct is None:
+                    raise ValueError("litemp_percentage is required for mixed precision quantization.")
+                return f"--range_scheme min_max --lite_mp percentage={pct};override_qtype={prec.name.split('_mixed_')[1]}"
+            return "--range_scheme min_max" if prec.name == "w8a16" else ""
 
     store = {"n": 0, "jobs": {}, "models": {}}
 
@@ -221,7 +230,8 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
 
     def run_quantize(prec, model, name, onnx_model, n, input_spec=None):
         j = types.SimpleNamespace(job_id=new_id("qj"), weights_dtype=prec.weights_type,
-                                  activations_dtype=prec.activations_type)
+                                  activations_dtype=prec.activations_type,
+                                  options=model.get_hub_quantize_options(prec))
         j.target = Model(new_id("qm"), input_spec=input_spec)
         store["jobs"][j.job_id] = j
         store["models"][j.target.model_id] = j.target
@@ -309,3 +319,39 @@ def test_cli_conflicting_fixed_setting():
         cli.main(["study", "run", "siglip2-text", "--axis", "batch", "--batch", "4"])
     with pytest.raises(SystemExit):
         cli.main(["study", "run", "siglip2-text", "--axis", "batch", "--context-length", "1024"])
+
+
+def test_mixed_precision_study_sets_and_verifies_lite_mp(tmp_path, monkeypatch):
+    _fake_qaihm(monkeypatch, tmp_path)
+    out = S.run("siglip2-text", "mixed-precision", ["0", "10", "25"], {"precision": "w8a8", "override": "int16"},
+                str(tmp_path / "mp"), compare=False)
+    st = json.loads((out / "study.json").read_text())
+    assert all(r["verified"] for r in st["variants"].values())
+    v10 = json.loads((out / "mixed-precision-10" / "verification.json").read_text())
+    lm = next(c for c in v10["checks"] if c["what"] == "mixed precision on the quantize job")
+    assert lm["ok"] and "percentage=10;override_qtype=int16" in lm["actual"]
+    v0 = json.loads((out / "mixed-precision-0" / "variant.json").read_text())
+    assert v0["settings"]["precision"] == "w8a8" and v0["settings"]["litemp"] is None
+    with pytest.raises(ValueError):  # a float base cannot be mixed
+        from hexprof.study import components as C
+        C.settings("siglip2-text", "mixed-precision", "10", {"precision": "float"})
+    with pytest.raises(ValueError):
+        core.validate("siglip2-text", "mixed-precision", ["100"])
+
+
+def test_ablation_summary_against_baseline(tmp_path, monkeypatch):
+    from hexprof.study import summary
+
+    _fake_qaihm(monkeypatch, tmp_path)
+    root = tmp_path / "studies"
+    S.run("siglip2-text", "batch", ["1", "8"], {}, str(root / "siglip2-text__batch"))
+    S.run("siglip2-image", "batch", ["2", "4"], {}, str(root / "siglip2-image__batch"))  # no baseline (1)
+    page = summary.summarize(root)
+    data = json.loads((page.parent / "summary.json").read_text())
+    (row,) = data["ablations"]
+    assert row["change"].endswith("1 → 8")
+    assert row["items_per_s__ratio"] == pytest.approx((8e3 / (1.0 + 1.6)) / (1e3 / 1.2))
+    assert any("siglip2-image / batch" in n for n in data["notes"])
+    p = _page(page)
+    bars = next(b for s in p["sections"] for b in s["blocks"] if b["type"] == "hbar")
+    assert bars["rows"][0]["value"] == pytest.approx(row["items_per_s__ratio"])

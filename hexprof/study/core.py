@@ -22,27 +22,34 @@ AXES: dict[str, dict[str, list[str]]] = {
     "gemma4-vision": {
         "image-size": ["224", "336", "448", "560"],
         "precision": ["float", "w8a16"],
+        "mixed-precision": ["0", "5", "10", "25", "50"],
         "qairt": ["default", "latest"],
     },
     "siglip2-image": {
         "batch": ["1", "2", "4", "8"],
         "precision": ["float", "w8a16", "w8a8", "w4a16"],
+        "mixed-precision": ["0", "5", "10", "25", "50"],
         "qairt": ["default", "latest"],
     },
     "siglip2-text": {
         "batch": ["1", "2", "4", "8", "16"],
         "precision": ["float", "w8a16", "w8a8", "w4a16"],
+        "mixed-precision": ["0", "5", "10", "25", "50"],
         "qairt": ["default", "latest"],
     },
 }
-NUMERIC_AXES = {"context-length", "prompt-length", "decode-tokens", "image-size", "batch"}
+NUMERIC_AXES = {"context-length", "prompt-length", "decode-tokens", "image-size", "batch", "mixed-precision"}
 BASELINE = {  # Qualcomm's shipped setting per axis: the reference every study includes
     ("gemma4-text", "context-length"): "4096", ("gemma4-text", "prompt-length"): "128",
     ("gemma4-text", "decode-tokens"): "1", ("gemma4-vision", "image-size"): "448",
     ("gemma4-vision", "precision"): "float", ("siglip2-image", "batch"): "1", ("siglip2-text", "batch"): "1",
     ("siglip2-image", "precision"): "w8a16", ("siglip2-text", "precision"): "w8a16",
     ("gemma4-vision", "qairt"): "default", ("siglip2-image", "qairt"): "default", ("siglip2-text", "qairt"): "default",
+    # mixed precision: 0 = no layers overridden (the plain base precision)
+    ("gemma4-vision", "mixed-precision"): "0", ("siglip2-image", "mixed-precision"): "0",
+    ("siglip2-text", "mixed-precision"): "0",
 }
+QUANTIZED = {"w8a16", "w8a8", "w4a16", "w4a8", "w16a16"}
 
 
 def default_study_dir(target: str, axis: str) -> Path:
@@ -56,7 +63,11 @@ def validate(target: str, axis: str, values: Sequence[str]) -> list[str]:
     if axis not in AXES[target]:
         raise ValueError(f"{target} has no axis {axis!r}; choose from {', '.join(AXES[target])}")
     vals = [str(v) for v in (values or AXES[target][axis])]
-    if axis in NUMERIC_AXES:
+    if axis == "mixed-precision":
+        bad = [v for v in vals if not v.isdigit() or not 0 <= int(v) < 100]
+        if bad:
+            raise ValueError(f"mixed-precision takes the percentage of layers kept at higher precision, 0-99; got {bad}")
+    elif axis in NUMERIC_AXES:
         bad = [v for v in vals if not v.isdigit() or int(v) <= 0]
         if bad:
             raise ValueError(f"{axis} takes positive integers; got {bad}")

@@ -104,7 +104,8 @@ def graph_metrics(label: str, kpis: dict[str, Any], instances: dict[str, Any], q
         out["kv_bytes"] = ana.get("kv_bytes", 0.0)
 
     macs = out.get("macs")
-    P = ctx.P.get(precision or "") if precision else None
+    # mixed precision (Lite-MP) is compared with the measured P of its base precision
+    P = (ctx.P.get(precision) or ctx.P.get(precision.split("_mixed")[0])) if precision else None
     B = ctx.B
     if macs and t_s:
         ops = 2 * macs
