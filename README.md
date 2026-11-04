@@ -323,6 +323,11 @@ export, `<component>/` for a SigLIP 2 run), attaches AI Hub's `<graph>.profile.j
   * **Optrace**: busy share and timeline per thread, counter tracks such as memory bandwidth over time,
     and time by op name.
   * **AI Hub per-layer profile**: slowest layers and compute unit.
+* **Inputs and outputs** of every graph, as AI Hub compiled them (`hw fetch-models` records the specs): image size
+  and patches, tokens per call, context length, batch, image tokens produced, and the output (vocabulary scores
+  for N positions, hidden states, embedding size). With `--requests <results.json>` from `gemma4 aihub` /
+  `siglip2 infer`, the overview adds your actual requests: original and encoder image size, image tokens, text
+  tokens, total prompt tokens and chunks, generated tokens, estimated time to first token and end to end.
 * `<graph>/*.csv`: every table, for your own plots; `summary.json`: headline numbers of every graph.
 
 Optrace timestamps are not always in µs. The report finds their unit by matching the trace's span

@@ -177,7 +177,9 @@ def test_report_with_ceilings_models_and_onnx(tmp_path):
     assert any(s["title"] == "Stalls and parallelism, per graph" for s in ov["sections"])
     page = data(index.parent / f"{label}.html")
     titles = [s["title"] for s in page["sections"]]
-    assert titles[1:3] == ["Compute and memory efficiency", "Stalls and parallelism"]
+    i = titles.index("Overall summary per HTP core")
+    assert titles[i + 1:i + 3] == ["Compute and memory efficiency", "Stalls and parallelism"]
+    assert titles[0] == "Inputs and outputs"
     per_op = next(s for s in page["sections"] if s["title"].startswith("Per-op roofline"))
     assert per_op["blocks"][0]["type"] == "roofline" and len(per_op["blocks"][0]["points"]) == 2
     unmatched = data(index.parent / f"{other}.html")
@@ -250,3 +252,81 @@ def test_memory_traffic_sections_and_totals_check(tmp_path):
     assert "Where the DRAM traffic goes: by QNN op type, per graph" in titles
     assert "Where the VTCM traffic goes: by QNN op type, per graph" in titles
     assert (index.parent / label / "memory_totals_check.csv").exists()
+
+
+def test_io_spec_formats_and_meaning():
+    from typing import NamedTuple
+
+    from hexprof.hwreport import io as IO
+
+    class TensorSpec(NamedTuple):  # as qai_hub.public_rest_api.TensorSpec
+        name: str
+        dtype: str
+        shape: tuple | None = None
+
+    linked = {"prompt_ar128_cl4096_4_of_4": [TensorSpec("input_embeds", "uint16", (1, 128, 2560))],
+              "token_ar1_cl4096_4_of_4": [TensorSpec("input_embeds", "uint16", (1, 1, 2560))]}
+    assert IO.shapes(linked, "token_ar1_cl4096_4_of_4") == {"input_embeds": [1, 1, 2560]}  # AI Hub IOSpec, per graph
+    assert IO.shapes({None: [TensorSpec("image", "float32", (1, 3, 224, 224))]}) == {"image": [1, 3, 224, 224]}
+    assert IO.shapes({"input_ids": ((4, 64), "int32")}) == {"input_ids": [4, 64]}  # job shapes / InputSpec
+    assert IO.shapes({"x": (1, 8)}) == {"x": [1, 8]}
+    assert IO.normalize({"x": {"shape": [2, 3], "dtype": "float32"}})["x"]["dtype"] == "float32"
+
+    d = IO.describe("part4_of_4__prompt_ar128_cl4096_4_of_4", IO.normalize(linked, "prompt_ar128_cl4096_4_of_4"),
+                    {"logits": {"shape": [1, 128, 262144], "dtype": "uint16"}})
+    assert d["tokens_per_call"] == 128 and d["context_length"] == 4096 and d["logit_positions"] == 128
+    assert d["vocab"] == 262144 and "vocabulary scores for 128" in d["output"]
+    v = IO.describe("vision_encoder__gemma_4_e4b_it",
+                    {"pixel_values": {"shape": [1, 784, 768]}, "image_position_ids": {"shape": [1, 784, 2]}},
+                    {"vision_embedding": {"shape": [1, 256, 2560]}})
+    assert v["image"] == "448×448" and v["patch"] == 16 and v["image_patches"] == 784 and v["image_tokens_out"] == 256
+    i = IO.describe("image_encoder", {"image": {"shape": [1, 3, 224, 224]}}, {"image_embeds": {"shape": [1, 768]}})
+    assert i["image"] == "224×224" and i["batch"] == 1 and i["embedding_dim"] == 768
+    tx = IO.describe("text_encoder", {"input_ids": {"shape": [8, 64]}}, {"text_embeds": {"shape": [8, 768]}})
+    assert tx["tokens_per_call"] == 64 and tx["batch"] == 8
+    rows = IO.table({"input_embeds": {"shape": [1, 1, 2560], "dtype": "uint16"},
+                     **{f"past_key_{k}_in": {"shape": [1, 2, 256, 4095], "dtype": "uint8"} for k in range(3)}}, {})
+    assert len(rows) == 2 and "+2 more KV tensors" in rows[1]["name"]
+
+
+def test_fetch_models_records_io_and_report_shows_it(tmp_path, monkeypatch):
+    from typing import NamedTuple
+
+    from hexprof.aihub import client as hc
+
+    class TS(NamedTuple):
+        name: str
+        dtype: str
+        shape: tuple | None = None
+
+    m = _M("mv", "vision", size=0.8e9)
+    m.input_spec = {"g": [TS("pixel_values", "float32", (1, 784, 768)), TS("image_position_ids", "int32", (1, 784, 2))]}
+    m.output_spec = {"g": [TS("vision_embedding", "float32", (1, 256, 2560))]}
+    monkeypatch.setattr(hc, "get_model", lambda mid: m)
+    root = tmp_path / "export"
+    hwfakes.write_json(root / "export_profiles.json", {"parts": {"vision_encoder/gemma_4_e4b_it": {
+        "graph": "gemma_4_e4b_it", "model_id": "mv", "job": {"job_id": "jv"}}}})
+    label = "vision_encoder__gemma_4_e4b_it"
+    hwfakes.write_json(root / "hw" / label / "qhas" / "j_main_qhas_summary.json", hwfakes.qhas_doc(40))
+    info = models.fetch([root])[label]
+    assert info["inputs"]["pixel_values"]["shape"] == [1, 784, 768] and info["outputs"]["vision_embedding"]["shape"][1] == 256
+    img = tmp_path / "photo.png"
+    from PIL import Image
+
+    Image.new("RGB", (1024, 768)).save(img)
+    req = hwfakes.write_json(tmp_path / "results.json", {"results": [{
+        "image": str(img), "prompt": "What is in the image?", "vision_encoder": {"image_tokens": 256},
+        "breakdown": {"prefill_tokens": 290, "prefill_chunks": 3, "prefill_chunk_tokens": 128, "decode_tokens": 41,
+                      "decode_tokens_source": "local answer", "ttft_ms": 1400.0, "e2e_ms": 4300.0}}]})
+    index = report.build([root], tmp_path / "out", requests=[req])
+    data = lambda p: json.loads(__import__("re").search(r'id="data">(.*?)</script>', p.read_text(), __import__("re").S)
+                                .group(1).replace("<\\/", "</"))
+    ov = data(index)
+    io_row = next(s for s in ov["sections"] if s["title"] == "Inputs and outputs per graph")["blocks"][0]["table"]["rows"][0]
+    assert io_row["image"] == "448×448" and io_row["image_tokens_out"] == 256
+    rq = next(s for s in ov["sections"] if s["title"].startswith("Your requests"))["blocks"][0]["table"]["rows"][0]
+    assert rq["original"] == "1024×768" and rq["fed"] == "448×448" and rq["image_tokens"] == 256
+    assert rq["text_tokens"] == 34 and rq["generated_tokens"] == 41 and rq["chunks"] == "3 × 128"
+    page = data(index.parent / f"{label}.html")
+    assert page["sections"][0]["title"] == "Inputs and outputs"
+    assert any("256 image tokens" in r["meaning"] for r in page["sections"][0]["blocks"][0]["table"]["rows"])

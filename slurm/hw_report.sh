@@ -38,18 +38,27 @@ B=${HEXPROF_DOWNLOAD_DIR}/runs/ceil-bandwidth/bandwidth_ceiling.json
 [ -f "$C" ] && CEIL+=(--compute-json "$C") || echo "No compute ceiling yet ($C): run slurm/ceilings.sh for % of P"
 [ -f "$B" ] && CEIL+=(--bandwidth-json "$B") || echo "No bandwidth ceiling yet ($B): run slurm/ceilings.sh for % of B"
 
+# your inference runs on real images and prompts (hexprof_vlm_infer.sbatch writes runs/<jobid>/{gemma4,siglip2})
+shopt -s nullglob
+GEMMA_REQ=("${HEXPROF_DOWNLOAD_DIR}"/runs/*/gemma4/results.json)
+SIGLIP_REQ=("${HEXPROF_DOWNLOAD_DIR}"/runs/*/siglip2/results.json)
+shopt -u nullglob
+echo "Gemma 4 requests found: ${#GEMMA_REQ[@]}; SigLIP 2 requests found: ${#SIGLIP_REQ[@]}"
+
 status=0
 GEMMA=${HEXPROF_DOWNLOAD_DIR}/gemma4-s25-export
 if [ -d "$GEMMA" ]; then
   srun -u hexprof hw fetch-models "$GEMMA" --onnx "${HEXPROF_FETCH_ONNX:-vision}" \
     || echo "fetch-models failed: the report continues without AI Hub model facts"
-  srun -u hexprof hw report "$GEMMA" --title "Gemma 4 E4B on Galaxy S25" "${CEIL[@]}" || status=$?
+  srun -u hexprof hw report "$GEMMA" --title "Gemma 4 E4B on Galaxy S25" "${CEIL[@]}" \
+    ${GEMMA_REQ:+--requests "${GEMMA_REQ[@]}"} || status=$?
 fi
 
 for d in "${HEXPROF_DOWNLOAD_DIR}"/runs/siglip2-profile-*/; do
   [ -d "$d" ] || continue
   srun -u hexprof hw fetch-models "$d" || echo "fetch-models failed: the report continues without AI Hub model facts"
-  srun -u hexprof hw report "$d" --title "SigLIP 2 on Galaxy S25" "${CEIL[@]}" || status=$?
+  srun -u hexprof hw report "$d" --title "SigLIP 2 on Galaxy S25" "${CEIL[@]}" \
+    ${SIGLIP_REQ:+--requests "${SIGLIP_REQ[@]}"} || status=$?
 done
 
 echo "Finished on: $(date) (exit code ${status})"

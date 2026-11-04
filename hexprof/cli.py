@@ -368,7 +368,8 @@ def cmd_hw_report(args: argparse.Namespace) -> int:
     out = args.out or str(Path(paths[0] if Path(paths[0]).is_dir() else Path(paths[0]).parent) / "hw_report")
     report.build(paths, out, top=args.top, bins=args.bins, title=args.title, compute_json=args.compute_json,
                  bandwidth_json=args.bandwidth_json, theory_gbps=args.theoretical_gbps,
-                 precisions=_parse_map(args.precision), gemma_config=args.gemma_config, onnx=_parse_map(args.onnx))
+                 precisions=_parse_map(args.precision), gemma_config=args.gemma_config, onnx=_parse_map(args.onnx),
+                 requests=args.requests or [])
     return 0
 
 
@@ -704,6 +705,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="theoretical DRAM bandwidth (default: S25, LPDDR5X-5300 x 64-bit)")
     p.add_argument("--precision", nargs="*", help="override a graph's precision, e.g. image_encoder=w8a16")
     p.add_argument("--gemma-config", help="Gemma 4 config.json (default: the one the export downloaded)")
+    p.add_argument("--requests", nargs="*", help="results.json of `gemma4 aihub` / `siglip2 infer` runs: adds your "
+                                                 "requests' image sizes and token counts")
     p.add_argument("--onnx", nargs="*", help="ONNX for per-op MACs, e.g. vision_encoder__gemma_4_e4b_it=/path/model.onnx "
                                              "(default: the ones `hw fetch-models --onnx` downloaded)")
     p.set_defaults(func=cmd_hw_report)

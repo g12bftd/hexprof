@@ -69,6 +69,7 @@ class Graph:
     published: dict[str, Any] | None = None  # AI Hub's published figures for this component, when known
     precision: str | None = None  # recorded by the run (SigLIP 2 profile.json), else inferred
     info: dict[str, Any] | None = None  # AI Hub model facts from `hexprof hw fetch-models`
+    io: dict[str, Any] = field(default_factory=dict)  # inputs / outputs and what they mean
     out: dict[str, Any] = field(default_factory=dict)
 
 
@@ -620,12 +621,101 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int, ctx: EF.Ctx | None 
                                                      {"key": "execution_time", "label": "Time", "kind": "us"},
                                                      {"key": "execution_cycles", "label": "Cycles", "kind": "num"}],
                                             "rows": layers[:500]}}]})
+    io_sec = _io_section(g)
+    if io_sec:
+        sections.insert(0, io_sec)
+    summary["io"] = g.io
     g.out = summary
     files = ", ".join(p.name for p in (g.qhas, g.optrace, g.profile) if p)
     return {"title": short_label(g.label), "subtitle": f"{g.label} · sources: {files}", "nav": {"href": "index.html", "text": "← All graphs"},
             "tiles": tiles, "sections": sections, "warnings": warnings,
             "footer": f"Tables as CSV in {g.label}/. Definitions quoted from Qualcomm's QAIRT Visualizer. "
                       f"QHAS schema {summary.get('qhas', {}).get('version', '–')}."}
+
+
+def _io_section(g: Graph) -> dict[str, Any] | None:
+    """Inputs and outputs of the graph as compiled (from `hexprof hw fetch-models`), and what they mean."""
+    from hexprof.hwreport import io as IO
+
+    info = g.info or {}
+    ins, outs = info.get("inputs") or {}, info.get("outputs") or {}
+    g.io = {**IO.describe(g.label, ins, outs), "inputs": ins, "outputs": outs}
+    if not (ins or outs):
+        d = {k: v for k, v in g.io.items() if k not in ("inputs", "outputs")}
+        if not d:
+            return None
+        text = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in d.items())
+        return {"title": "Inputs and outputs", "why": "From the graph name only. Run `hexprof hw fetch-models` for the "
+                "exact shapes AI Hub compiled.", "blocks": [{"type": "note", "text": text}]}
+    d = g.io
+    facts = [f"{k}: {d[k]}" for k in ("role", "image", "image_patches", "tokens_per_call", "context_length", "batch",
+                                     "image_tokens_out", "logit_positions", "vocab", "embedding_dim") if d.get(k) is not None]
+    return {"title": "Inputs and outputs", "why": "What this compiled graph takes and returns on the device, as AI Hub "
+            "reports it for the model it profiled (shapes are per call; a static graph always runs at these sizes, "
+            "padding shorter inputs). " + "; ".join(f.replace("_", " ") for f in facts) + ".",
+            "blocks": [{"type": "note", "text": "", "table": {"open": True, "cols": [
+                {"key": "direction", "label": "", "kind": "str"}, {"key": "name", "label": "Tensor", "kind": "str"},
+                {"key": "shape", "label": "Shape", "kind": "str"}, {"key": "dtype", "label": "Type", "kind": "str"},
+                {"key": "meaning", "label": "Meaning", "kind": "str"}], "rows": IO.table(ins, outs)}}]}
+
+
+def requests_section(paths: Sequence[str | Path], graphs: list[Graph]) -> dict[str, Any] | None:
+    """Your actual requests (`gemma4 aihub` / `siglip2 infer` results.json): image sizes and token counts."""
+    rows: list[dict[str, Any]] = []
+    fed = {g.label: (g.io or {}).get("image") for g in graphs if (g.io or {}).get("image")}
+    fed_img = next((v for k, v in fed.items() if "vision" in k), None) or next(iter(fed.values()), None)
+    for p in map(Path, paths):
+        if not p.exists():
+            continue
+        d = json.loads(p.read_text())
+        for r in d.get("results") or []:  # gemma4 aihub
+            b, v = r.get("breakdown") or {}, r.get("vision_encoder") or {}
+            img_tok = v.get("image_tokens")
+            total = b.get("prefill_tokens")
+            rows.append({"model": "Gemma 4", "image": Path(r.get("image", "")).name, "original": _img_size(r.get("image")),
+                         "fed": (f"{r['image_size_fed'][0]}×{r['image_size_fed'][1]}" if r.get("image_size_fed")
+                                 else fed_img or "448×448"),
+                         "prompt": (r.get("prompt") or "")[:80], "image_tokens": img_tok,
+                         "text_tokens": total - img_tok if total and img_tok else None, "prompt_tokens": total,
+                         "chunks": f"{b.get('prefill_chunks')} × {b.get('prefill_chunk_tokens')}" if b.get("prefill_chunks") else None,
+                         "generated_tokens": b.get("decode_tokens"), "generated_source": b.get("decode_tokens_source"),
+                         "ttft_ms": b.get("ttft_ms"), "e2e_ms": b.get("e2e_ms"), "source": str(p)})
+        if d.get("embedding_dim") and d.get("images"):  # siglip2 infer
+            for img in d["images"]:
+                rows.append({"model": "SigLIP 2", "image": Path(img).name, "original": _img_size(img),
+                             "fed": fed.get("image_encoder") or "224×224", "prompt": ", ".join(d.get("labels") or [])[:80],
+                             "text_tokens": f"{len(d.get('labels') or [])} label(s) × 64 (padded)" if d.get("labels") else None,
+                             "output": f"embedding of size {d['embedding_dim']}", "source": str(p)})
+    if not rows:
+        return None
+    return {"title": "Your requests: images and tokens", "why": "From the inference runs on your own image and prompt. "
+            "Prompt tokens include the chat template and the image tokens the vision encoder produced; the prompt is "
+            "processed in chunks of the prompt graph's length. Generated tokens: the length of the answer (from the local "
+            "llama.cpp run when available, else --max-new-tokens). Times are AI Hub-based estimates.",
+            "blocks": [{"type": "note", "text": "", "table": {"open": True, "cols": [
+                {"key": "model", "label": "Model", "kind": "str"}, {"key": "image", "label": "Image", "kind": "str"},
+                {"key": "original", "label": "Original size", "kind": "str"},
+                {"key": "fed", "label": "Fed to the encoder", "kind": "str"},
+                {"key": "prompt", "label": "Prompt / labels", "kind": "str"},
+                {"key": "image_tokens", "label": "Image tokens", "kind": "num"},
+                {"key": "text_tokens", "label": "Text + template tokens", "kind": "str"},
+                {"key": "prompt_tokens", "label": "Prompt tokens (total)", "kind": "num"},
+                {"key": "chunks", "label": "Prompt chunks", "kind": "str"},
+                {"key": "generated_tokens", "label": "Generated tokens", "kind": "num"},
+                {"key": "generated_source", "label": "Generated from", "kind": "str"},
+                {"key": "ttft_ms", "label": "Time to first token (ms)", "kind": "num"},
+                {"key": "e2e_ms", "label": "End to end (ms)", "kind": "num"},
+                {"key": "output", "label": "Output", "kind": "str"}], "rows": rows}}]}
+
+
+def _img_size(path: Any) -> str | None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return f"{im.size[0]}×{im.size[1]}"
+    except Exception:  # noqa: BLE001 - the image may not be on this machine
+        return None
 
 
 def _instance_cols() -> list[dict[str, str]]:
@@ -691,7 +781,8 @@ def _stack_block(rows: list[dict[str, Any]], series: list[str], title: str) -> d
                       "rows": [{"label": r["label"], **dict(zip(series, r["values"]))} for r in rows]}}
 
 
-def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) -> dict[str, Any]:
+def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
+                  requests_sec: dict[str, Any] | None = None) -> dict[str, Any]:
     rows = []
     for g in graphs:
         k = g.out.get("qhas", {}).get("kpis", {})
@@ -734,6 +825,23 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) ->
                      f"{pub['time_to_first_token_range_milliseconds']['min']:.0f} ms. Same ballpark expected, not equality.")
         blocks_e2e.append({"type": "note", "text": text})
     sections: list[dict[str, Any]] = []
+    io_rows = [{"label": short_label(g.label), **{k: v for k, v in (g.io or {}).items() if k not in ("inputs", "outputs")}}
+               for g in graphs if g.io]
+    if io_rows:
+        sections.append({"title": "Inputs and outputs per graph",
+                         "why": "Per call of each compiled graph (static shapes). Exact when `hexprof hw fetch-models` "
+                                "has recorded AI Hub's input / output specs, else read from the graph name.",
+                         "blocks": [{"type": "note", "text": "", "table": {"open": True, "cols": [
+                             {"key": "label", "label": "Graph", "kind": "str"}, {"key": "role", "label": "Role", "kind": "str"},
+                             {"key": "image", "label": "Image (px)", "kind": "str"},
+                             {"key": "image_patches", "label": "Patches", "kind": "num"},
+                             {"key": "tokens_per_call", "label": "Tokens per call", "kind": "num"},
+                             {"key": "context_length", "label": "Context", "kind": "num"},
+                             {"key": "batch", "label": "Batch", "kind": "num"},
+                             {"key": "image_tokens_out", "label": "Image tokens out", "kind": "num"},
+                             {"key": "output", "label": "Output", "kind": "str"}], "rows": io_rows}}]})
+    if requests_sec:
+        sections.append(requests_sec)
     if blocks_e2e:
         sections.append({"title": "End to end (from the parts)", "why": "Decode = 1 ÷ (sum of the token graphs); prefill = "
                          "chunk length ÷ (sum of the prompt graphs).", "blocks": blocks_e2e})
@@ -825,7 +933,8 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) ->
 def build(paths: Sequence[str | Path], out_dir: str | Path, top: int = 15, bins: int = 400,
           title: str | None = None, compute_json: str | Path | None = None, bandwidth_json: str | Path | None = None,
           theory_gbps: float = EF.THEORETICAL_GBPS, precisions: dict[str, str] | None = None,
-          gemma_config: str | None = None, onnx: dict[str, str] | None = None) -> Path:
+          gemma_config: str | None = None, onnx: dict[str, str] | None = None,
+          requests: Sequence[str | Path] = ()) -> Path:
     from hexprof.ceilings.experiments import load_ceilings
 
     out = Path(out_dir)
@@ -853,7 +962,7 @@ def build(paths: Sequence[str | Path], out_dir: str | Path, top: int = 15, bins:
         page = graph_page(g, out, top, bins, ctx)
         (out / f"{g.label}.html").write_text(H.render_page(_jsonable(page)), encoding="utf-8")
         print(f"    done in {time.time() - t:.1f} s", flush=True)
-    ov = overview_page(graphs, title or "NPU hardware report", ctx)
+    ov = overview_page(graphs, title or "NPU hardware report", ctx, requests_section(requests, graphs))
     (out / "index.html").write_text(H.render_page(_jsonable(ov)), encoding="utf-8")
     write_json(out / "summary.json", {"_ceilings": {"P_tops": ctx.P, "B_gbps": ctx.B, "B_series": ctx.B_series,
                                                     "theoretical_gbps": theory_gbps, **ctx.ceilings_src},

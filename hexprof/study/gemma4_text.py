@@ -129,8 +129,14 @@ def verify(axis: str, value: str, vdir: Path, fixed: dict[str, Any], device: str
         q = core.qairt_of(job)
         if q:
             qairt.add(q)
-        src, cjob = MD.source_of(job.model, graph)
-        shapes = core.shapes_of(getattr(cjob, "shapes", None)) if cjob is not None else {}
+        # the profiled (linked) binary's own spec for this graph; else the compile job behind it
+        try:
+            shapes = core.shapes_of(getattr(job.model, "input_spec", None), graph)
+        except Exception:  # noqa: BLE001
+            shapes = {}
+        if not shapes:
+            src, cjob = MD.source_of(job.model, graph)
+            shapes = core.shapes_of(getattr(cjob, "shapes", None)) if cjob is not None else {}
         if shapes and ar is not None:
             seq_ok, ctx_ok, ev = _shape_evidence(shapes, ar, ctx)
             core.check(checks, f"{label}: compiled input shapes", f"sequence {ar}, context {ctx}", ev or str(shapes)[:300],

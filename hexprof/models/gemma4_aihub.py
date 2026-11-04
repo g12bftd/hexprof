@@ -124,6 +124,8 @@ def prepare(processor: Any, image_path: str | Path, prompt: str, image_size: int
     """Gemma 4 chat template on (image, prompt): token count + the vision encoder's inputs."""
     from PIL import Image
 
+    with Image.open(image_path) as im:
+        original = list(im.size)
     img = Image.open(image_path).convert("RGB").resize((image_size, image_size))
     messages = [{"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": prompt}]}]
     inputs = processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt",
@@ -131,6 +133,8 @@ def prepare(processor: Any, image_path: str | Path, prompt: str, image_size: int
     ids = _as_np(inputs["input_ids"])
     return {
         "prompt_tokens": int(ids.shape[-1]),
+        "image_size_original": original,
+        "image_size_fed": [image_size, image_size],
         "pixel_values": _as_np(inputs["pixel_values"]).astype(np.float32),
         # AI Hub runs int64 graph inputs as int32 (as qai_hub_models does)
         "image_position_ids": _as_np(inputs["image_position_ids"]).astype(np.int32),
@@ -261,7 +265,8 @@ def infer(
                            vision["metrics"]["inference_time_milliseconds"] if vision else None)
             est["decode_tokens_source"] = "local answer" if ans and ans.get("generated_tokens") else "--max-new-tokens"
             results.append({"image": str(image), "prompt": prompt, "answer": ans, "vision_encoder": vision,
-                            "breakdown": est})
+                            "breakdown": est, "image_size_original": prep.get("image_size_original"),
+                            "image_size_fed": prep.get("image_size_fed")})
     report = {
         "device": device_name,
         "export_dir": str(export_dir or default_export_dir()),

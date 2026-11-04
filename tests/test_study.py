@@ -224,9 +224,17 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
         store["models"][m.model_id] = m
         return m
 
+    from typing import NamedTuple
+
+    class TS(NamedTuple):  # AI Hub reports a compiled model's spec keyed by graph name
+        name: str
+        dtype: str
+        shape: tuple | None = None
+
     def run_compile(model, name, dev, rt, prec, source, spec, extra_options=""):
         j = CompileJob(new_id("cj"), spec, source=source, options=extra_options)
-        j.target = Model(new_id("cm"), input_spec=spec, producer=j)
+        iospec = {name: [TS(k, v[1], tuple(v[0])) for k, v in spec.items()]}
+        j.target = Model(new_id("cm"), input_spec=iospec, producer=j)
         store["jobs"][j.job_id] = j
         store["models"][j.target.model_id] = j.target
         return j
@@ -253,7 +261,7 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
         return j
 
     def save_profile(job, out_dir, stem):
-        b = job.model.input_spec["input_ids"][0][0]
+        b = next(iter(job.model.input_spec.values()))[0].shape[0]
         prof = hwfakes.profile_doc(ms=1.0 + 0.2 * b)
         return prof, hwfakes.write_json(Path(out_dir) / f"{stem}.profile.json", prof)
 

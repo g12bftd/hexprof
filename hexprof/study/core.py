@@ -182,29 +182,17 @@ def check(checks: list[dict[str, Any]], what: str, expected: Any, actual: Any, o
     checks.append({"what": what, "expected": expected, "actual": actual, "ok": bool(ok), "note": note})
 
 
-def shapes_of(spec: Any) -> dict[str, list[int]]:
-    """{input name: dims} from an AI Hub job's ``shapes`` / a model's ``input_spec`` / a qai_hub_models InputSpec."""
-    out: dict[str, list[int]] = {}
-    for name, s in (spec or {}).items():
-        dims = getattr(s, "shape", None)
-        if dims is None:
-            dims = s[0] if isinstance(s, (tuple, list)) and s and isinstance(s[0], (tuple, list)) else s
-        try:
-            out[str(name)] = [int(d) for d in dims]
-        except (TypeError, ValueError):
-            pass
-    return out
+def shapes_of(spec: Any, graph: str | None = None) -> dict[str, list[int]]:
+    """{input name: dims} from an AI Hub job's ``shapes``, a model's ``input_spec`` (keyed by graph) or an InputSpec."""
+    from hexprof.hwreport import io as IO
+
+    return IO.shapes(spec, graph)
 
 
-def dtypes_of(spec: Any) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for name, s in (spec or {}).items():
-        dt = getattr(s, "dtype", None)
-        if dt is None and isinstance(s, (tuple, list)) and len(s) > 1:
-            dt = s[1]
-        if dt is not None:
-            out[str(name)] = str(dt)
-    return out
+def dtypes_of(spec: Any, graph: str | None = None) -> dict[str, str]:
+    from hexprof.hwreport import io as IO
+
+    return {k: v["dtype"] for k, v in IO.normalize(spec, graph).items() if v.get("dtype")}
 
 
 def qairt_of(job: Any) -> str | None:

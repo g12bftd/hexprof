@@ -126,22 +126,33 @@ def fetch(paths: Sequence[str | Path], onnx: str = "none", max_onnx_gb: float = 
         dest = Path(ref["root"]) / "models" / f"{label}.model.json"
         info: dict[str, Any] = read_json(dest) if dest.exists() and not refresh else {}
         want_onnx = onnx == "all" or (onnx == "vision" and "vision" in label)
-        if info and not info.get("error") and (info.get("onnx_path") or info.get("onnx_skipped") or not want_onnx):
+        if (info and not info.get("error") and "outputs" in info
+                and (info.get("onnx_path") or info.get("onnx_skipped") or not want_onnx)):
             print(f"{label}: cached ({dest})")
             out[label] = info
             continue
         try:
             model = hc.get_model(ref["model_id"]) if ref.get("model_id") else hc.get_job(ref["job_id"]).model
+            from hexprof.hwreport import io as IO
+
             info = {"label": label, "job_id": ref.get("job_id"), "compiled_model_id": model.model_id,
                     "compiled_name": getattr(model, "name", None), "compiled_type": str(getattr(model, "model_type", "")),
                     "compiled_file_size": getattr(model, "file_size", None),
                     "compiled_num_parameters": getattr(model, "num_parameters", None)}
+            # inputs / outputs of this graph as compiled (a linked part holds its prompt and token graphs)
+            for key, attr in (("inputs", "input_spec"), ("outputs", "output_spec")):
+                try:
+                    info[key] = IO.normalize(getattr(model, attr, None), ref.get("graph"))
+                except Exception:  # noqa: BLE001 - optional
+                    info[key] = {}
             src, cjob = source_of(model, ref.get("graph"))
             if src is not None:
                 info.update(source_model_id=src.model_id, source_name=getattr(src, "name", None),
                             source_type=str(getattr(src, "model_type", "")), source_file_size=getattr(src, "file_size", None),
                             source_num_parameters=getattr(src, "num_parameters", None),
                             compile_job_id=getattr(cjob, "job_id", None), shapes=_shapes(cjob))
+                if not info.get("inputs") and info.get("shapes"):
+                    info["inputs"] = {k: {"shape": v, "dtype": None} for k, v in info["shapes"].items()}
             if want_onnx and src is not None:
                 size = getattr(src, "file_size", None) or 0
                 if size > max_onnx_gb * 1e9:
