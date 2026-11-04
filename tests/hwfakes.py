@@ -86,7 +86,8 @@ def qhas_doc(n_instances: int = 600, seed: int = 0, strings: bool = False, threa
     }
 
 
-def optrace_doc(n: int = 400, seed: int = 0, bare_list: bool = False) -> Any:
+def optrace_doc(n: int = 400, seed: int = 0, bare_list: bool = False, span: float | None = None) -> Any:
+    """Chrome-trace events; ``span`` rescales all timestamps so the trace lasts exactly that many units."""
     rnd = random.Random(seed)
     ev: list[dict[str, Any]] = [
         {"ph": "M", "name": "process_name", "pid": 1, "args": {"name": "HTP"}},
@@ -108,15 +109,26 @@ def optrace_doc(n: int = 400, seed: int = 0, bare_list: bool = False) -> Any:
     for k in range(0, int(max(t)), 5):
         ev.append({"ph": "C", "name": "Memory Bandwidth", "pid": 2, "ts": float(k), "args": {"GB/s": round(20 + 30 * rnd.random(), 2)}})
     ev.append({"ph": "i", "name": "marker", "pid": 1, "tid": 0, "ts": 1.0})
+    if span:
+        xs = [e for e in ev if e["ph"] == "X"]
+        t0, t1 = min(e["ts"] for e in xs), max(e["ts"] + e["dur"] for e in xs)
+        f = span / (t1 - t0)
+        for e in ev:
+            if "ts" in e:
+                e["ts"] = (e["ts"] - t0) * f
+            if "dur" in e:
+                e["dur"] *= f
     return ev if bare_list else {"traceEvents": ev, "displayTimeUnit": "ns"}
 
 
-def profile_doc(seed: int = 0, n: int = 30) -> dict[str, Any]:
+def profile_doc(seed: int = 0, n: int = 30, ms: float = 21.5) -> dict[str, Any]:
     rnd = random.Random(seed)
     detail = [{"name": f"/model/layers.{i // 3}/{op}", "type": op, "compute_unit": "NPU" if i % 10 else "CPU",
                "execution_time": round(rnd.expovariate(1 / 300), 1), "execution_cycles": int(rnd.random() * 1e6)}
               for i, op in enumerate(rnd.choice(["MatMul", "RmsNorm", "Softmax", "Add"]) for _ in range(n))]
-    return {"execution_summary": {"estimated_inference_time": 21500, "inference_memory_peak_range": [1, 2]},
+    return {"execution_summary": {"estimated_inference_time": ms * 1000, "inference_memory_peak_range": [0, 180 * 2**20],
+                                  "first_load_time": 900000, "warm_load_time": 120000,
+                                  "all_inference_times": [ms * 1000 * (1 + 0.01 * k) for k in range(5)]},
             "execution_detail": detail}
 
 
@@ -126,14 +138,18 @@ def write_json(path: Path, obj: Any) -> Path:
     return path
 
 
-def gemma_export_layout(root: Path, parts: int = 2, instances: int = 600, strings: bool = False) -> Path:
+def gemma_export_layout(root: Path, parts: int = 2, instances: int = 600, strings: bool = False,
+                        trace_ratio: float = 1.0) -> Path:
     """Mirror `hexprof pipeline gemma4 export`: hw/<label>/{qhas,optrace}/ + profiles/<label>.profile.json."""
     for i in range(1, parts + 1):
         for g, graph in enumerate(("prompt_ar128_cl4096", "token_ar1_cl4096")):
             label = f"part_{i}_of_{parts}__{graph}_{i}_of_{parts}"
             job = f"j{i}{g}abcdef"
-            write_json(root / "hw" / label / "qhas" / f"{job}_main_qhas_summary.json",
-                       qhas_doc(instances, seed=10 * i + g, strings=strings))
-            write_json(root / "hw" / label / "optrace" / f"{job}_main_profile_trace.json", optrace_doc(300, seed=i + g))
-            write_json(root / "profiles" / f"{label}.profile.json", profile_doc(seed=i + g))
+            q = qhas_doc(instances, seed=10 * i + g, strings=strings)
+            write_json(root / "hw" / label / "qhas" / f"{job}_main_qhas_summary.json", q)
+            cycles = float(q["data"]["htp_overall_summary"]["data"][0]["timeline_cycles"])
+            # like the real files: optrace timestamps in HTP cycles, spanning ~ the QHAS run
+            write_json(root / "hw" / label / "optrace" / f"{job}_main_profile_trace.json",
+                       optrace_doc(300, seed=i + g, span=cycles * trace_ratio))
+            write_json(root / "profiles" / f"{label}.profile.json", profile_doc(seed=i + g, ms=20.0 if g == 0 else 10.0))
     return root

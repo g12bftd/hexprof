@@ -107,9 +107,9 @@ def test_build_report_end_to_end(tmp_path):
     assert len(pages) == 5 and "index.html" in pages
     ov = _page_data(index.read_text())
     assert ov["title"] == "Gemma 4 on S25"
-    table = ov["sections"][0]["blocks"][0]["table"]
+    table = next(s for s in ov["sections"] if s["title"] == "Graphs")["blocks"][0]["table"]
     assert len(table["rows"]) == 4 and all(r["util"] is not None and r["href"].endswith(".html") for r in table["rows"])
-    stacked = next(s for s in ov["sections"] if s["title"].startswith("Where the cycles go"))["blocks"][0]
+    stacked = next(s for s in ov["sections"] if s["title"].startswith("Where the work goes"))["blocks"][0]
     assert len(stacked["series"]) <= 8 and stacked["series"][-1] == "Other"
     assert all(sum(r["values"]) == pytest.approx(100) for r in stacked["rows"])
 
@@ -118,10 +118,11 @@ def test_build_report_end_to_end(tmp_path):
     page = _page_data((out / f"{label}.html").read_text())
     titles = [s["title"] for s in page["sections"]]
     for want in ("Overall summary per HTP core", "Resource utilization (HMX, HVX, …)", "QNN op types", "HTP op types",
+                 "What sets the run time: critical path by unit", "AI Hub profile summary",
                  "Critical path: ops that set the run time", "QHAS timeline: HTP thread occupancy",
                  "Optrace: busy share per thread", "Optrace: counters (memory tracks)", "AI Hub per-layer profile"):
         assert want in titles, want
-    qnn = next(s for s in page["sections"] if s["title"] == "QNN op types")["blocks"][0]
+    qnn = next(b for s in page["sections"] if s["title"] == "QNN op types" for b in s["blocks"] if b["type"] == "hbar")
     assert len(qnn["rows"]) == 7 and qnn["rows"][-1]["label"].startswith("Other")  # top 6 + Other
     assert sum(r["value"] for r in qnn["rows"]) == pytest.approx(100)
     assert {t["label"] for t in page["tiles"]} >= {"HTP utilization", "Inferences per second", "DRAM traffic"}
@@ -146,3 +147,62 @@ def test_cli_hw_report(tmp_path, capsys):
 def test_build_without_files_errors(tmp_path):
     with pytest.raises(FileNotFoundError):
         report.build([tmp_path], tmp_path / "o")
+
+
+def test_optrace_unit_is_identified_from_qhas(tmp_path):
+    q = hwfakes.qhas_doc(100, seed=5)
+    k = q["data"]["htp_overall_summary"]["data"][0]
+    cycles, time_us = float(k["timeline_cycles"]), float(k["time_us"])
+    cases = {"cycles": (cycles, "HTP clock cycles"), "us": (time_us, "µs"), "ns": (time_us * 1e3, "ns")}
+    for name, (span, word) in cases.items():
+        p = hwfakes.write_json(tmp_path / f"{name}.json", hwfakes.optrace_doc(150, seed=6, span=span))
+        ot = optrace.load(p, bins=20)
+        optrace.calibrate(ot, cycles, time_us)
+        assert ot.unit == "µs" and word in ot.unit_note, name
+        assert ot.span_us == pytest.approx(time_us, rel=1e-6), name
+        assert ot.timeline["t1"] - ot.timeline["t0"] == pytest.approx(time_us, rel=1e-6)
+        assert sum(ln["busy_share"] for ln in ot.lanes) > 0
+    assert ot.declared_unit == "ns"
+    p = hwfakes.write_json(tmp_path / "odd.json", hwfakes.optrace_doc(150, seed=6, span=time_us * 2.1e3))
+    ot = optrace.load(p, bins=20)
+    optrace.calibrate(ot, cycles, time_us)
+    assert ot.unit == "trace units" and ot.span_us is None and "not identified" in ot.unit_note
+
+
+def test_critical_path_cycles_by_unit(tmp_path):
+    doc = hwfakes.qhas_doc(300, seed=8)
+    p = hwfakes.write_json(tmp_path / "q.json", doc)
+    bk = qhas.load(p).instances["by_kind"]
+    insts = doc["data"]["htp_op_instances"]["data"]
+    assert sum(v["dp_cycles"] for v in bk.values()) == pytest.approx(sum(r["num_dominant_path_cycles"] for r in insts))
+    assert bk["HMX (matrix)"]["dp_cycles"] == pytest.approx(sum(r["num_dominant_path_cycles"] for r in insts if r["hmx"]))
+
+
+def test_report_end_to_end_rollup_units_and_published(tmp_path):
+    root = hwfakes.gemma_export_layout(tmp_path / "e", parts=2, instances=120)
+    sig = tmp_path / "e" / "siglip" / "image_encoder"
+    hwfakes.write_json(sig / "qhas" / "x_main_qhas_summary.json", hwfakes.qhas_doc(80))
+    hwfakes.write_json(sig / "image_encoder.profile.json", hwfakes.profile_doc(ms=3.3))
+    hwfakes.write_json(sig.parent / "profile.json", {"precision": "w8a16", "runtime": "qnn_dlc", "components": {
+        "image_encoder": {"published": {"inference_time_milliseconds": 3.319, "job_id": "jpx0kk1jp",
+                                        "estimated_peak_memory_range_mb": {"min": 0, "max": 180},
+                                        "layer_counts": {"npu": 404, "total": 404}}}}})
+    index = report.build([root], tmp_path / "out", top=5, bins=30)
+    ov = _page_data(index.read_text())
+    tiles = {t["label"]: t for t in ov["tiles"]}
+    assert tiles["Decode (AI Hub)"]["value"] == "50.0 tok/s"  # 2 token parts × 10 ms
+    assert tiles["Prefill (AI Hub)"]["value"] == "3200 tok/s"  # 128 tokens in 2 × 20 ms
+    e2e = next(s for s in ov["sections"] if s["title"].startswith("End to end"))
+    assert "13.36 tok/s" in e2e["blocks"][0]["text"] and "q4_0" in e2e["blocks"][0]["text"]
+    rows = {r["folder"]: r for r in next(s for s in ov["sections"] if s["title"] == "Graphs")["blocks"][0]["table"]["rows"]}
+    assert rows["image_encoder"]["published_ms"] == 3.319 and rows["image_encoder"]["peak_mb"] == 180
+    g = next(r for f, r in rows.items() if f.startswith("part_1_of_2__prompt"))
+    assert g["trace_ms"] == pytest.approx(g["time_ms"], rel=1e-6)  # cycles -> µs via QHAS
+    titles = [s["title"] for s in ov["sections"]]
+    assert "What sets the run time: critical path by unit, per graph" in titles
+    assert "What sets the run time: critical path by QNN op type, per graph" in titles
+    page = _page_data((index.parent / "image_encoder.html").read_text())
+    summ = next(s for s in page["sections"] if s["title"] == "AI Hub profile summary")
+    trows = {r["metric"]: r for r in summ["blocks"][0]["table"]["rows"]}
+    assert trows["Inference time"]["published"] == "3.319 ms" and trows["Warm load time"]["value"] == "120.000 ms"
+    assert any(t["label"] == "AI Hub peak memory" for t in page["tiles"])

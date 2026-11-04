@@ -9,6 +9,8 @@ name processes and threads, complete events (``ph: "X"``) are op slices on a
 
 from __future__ import annotations
 
+import math
+import re
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -32,10 +34,38 @@ class OptraceReport:
     counters: list[dict[str, Any]]  # per (process, counter name): stats + downsampled series
     timeline: dict[str, Any] | None = None
     other_phases: dict[str, int] = field(default_factory=dict)
+    unit: str = "µs"  # unit of all times below; "µs" once identified, else "trace units"
+    unit_note: str = "Times assumed to be µs (Chrome trace convention); not cross-checked."
+    declared_unit: str | None = None  # "displayTimeUnit" in the file, if any (display hint only)
+    raw_span: float | None = None  # span in the file's own timestamp units
+
+    @property
+    def span(self) -> float | None:
+        return None if self.t0 is None or self.t1 is None else self.t1 - self.t0
 
     @property
     def span_us(self) -> float | None:
-        return None if self.t0 is None or self.t1 is None else self.t1 - self.t0
+        return self.span if self.unit == "µs" else None
+
+    def rescale(self, factor: float, unit: str, note: str) -> None:
+        """Convert every time quantity (not shares) by ``factor`` into ``unit``."""
+        if self.t0 is not None:
+            self.t0, self.t1 = self.t0 * factor, self.t1 * factor
+        for ln in self.lanes:
+            ln["busy_us"] *= factor
+        for o in self.ops:
+            for k in ("total_us", "max_us", "mean_us"):
+                o[k] *= factor
+        for c in self.counters:
+            c["series"] = [[pt[0] * factor, *pt[1:]] for pt in c["series"]]
+        if self.timeline:
+            self.timeline.update(t0=self.timeline["t0"] * factor, t1=self.timeline["t1"] * factor, unit=unit)
+        self.unit, self.unit_note = unit, note
+
+    def mark_unknown(self, note: str) -> None:
+        self.unit, self.unit_note = "trace units", note
+        if self.timeline:
+            self.timeline["unit"] = "trace units"
 
 
 def _f(v: Any) -> float | None:
@@ -129,7 +159,53 @@ def load(path: str | Path, bins: int = 400, max_points: int = 1500) -> OptraceRe
     timeline = None
     if span and s.size:
         timeline = _occupancy(s, d, li, [lane["name"] for lane in lanes], t0, t1, bins)
-    return OptraceReport(path, n, t0, t1, {str(k): v for k, v in proc_name.items()}, lanes, ops, ctr, timeline, dict(other))
+    rep = OptraceReport(path, n, t0, t1, {str(k): v for k, v in proc_name.items()}, lanes, ops, ctr, timeline, dict(other))
+    rep.declared_unit = declared_unit(path)
+    rep.raw_span = span
+    return rep
+
+
+def declared_unit(path: str | Path, window: int = 1 << 16) -> str | None:
+    """``displayTimeUnit`` from the head/tail of the file (top-level keys sit at either end)."""
+    p = Path(path)
+    with open(p, "rb") as f:
+        head = f.read(window)
+        f.seek(max(0, p.stat().st_size - window))
+        tail = f.read()
+    m = re.search(rb'"displayTimeUnit"\s*:\s*"(\w+)"', head + tail)
+    return m.group(1).decode() if m else None
+
+
+def calibrate(rep: OptraceReport, timeline_cycles: float | None, time_us: float | None, tol: float = 1.25) -> None:
+    """Identify the timestamp unit by matching the trace span against the same graph's QHAS run.
+
+    QNN HTP traces are not always in µs. The span is compared with the QHAS run in HTP cycles,
+    µs and ns; the first match within ``tol`` sets the conversion to µs. No match: times stay in
+    "trace units" (shares and busy fractions are unit-free and stay valid).
+    """
+    span = rep.span
+    if not span:
+        return
+    checks = []
+    if timeline_cycles and time_us:
+        checks.append(("HTP clock cycles", span / timeline_cycles, time_us / timeline_cycles))
+    if time_us:
+        checks += [("µs", span / time_us, 1.0), ("ns", span / (time_us * 1e3), 1e-3)]
+    # closest match wins (a ~1 GHz clock makes cycles and ns look alike; the nearer one is right)
+    for name, ratio, factor in sorted(checks, key=lambda c: abs(math.log(c[1])) if c[1] > 0 else math.inf)[:1]:
+        if 1 / tol <= ratio <= tol:
+            note = (f"Trace timestamps are in {name}: the trace spans {ratio:.3f}× the QHAS run "
+                    f"({time_us / 1e3:.3f} ms), so times were converted to µs" + (
+                        f" with QHAS's {factor * 1e3:.4f} ns per cycle." if name.startswith("HTP") else "."))
+            if factor != 1.0 or name != "µs":
+                rep.rescale(factor, "µs", note)
+            else:
+                rep.unit_note = note
+            return
+    if time_us:
+        detail = ", ".join(f"{r:.3g}× in {n}" for n, r, _ in checks)
+        rep.mark_unknown(f"Time unit not identified: compared with the QHAS run, the trace span is {detail}. "
+                         "Times are shown in the file's own units; busy shares are unaffected.")
 
 
 def _time_weighted_mean(x: np.ndarray, y: np.ndarray) -> float:

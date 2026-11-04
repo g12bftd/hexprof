@@ -298,13 +298,20 @@ It scans the folders for QHAS / optrace files, groups them by graph (`hw/<part>_
 export, `<component>/` for a SigLIP 2 run), attaches AI Hub's `<graph>.profile.json`, and writes
 `hw_report/` (default: inside the first folder given):
 
-* `index.html`: every graph side by side. Run time, HTP utilization, inferences per second, DRAM/VTCM
-  bytes and average GB/s, and where the cycles go (HMX / HVX / DMA / sync / reference ops / format changes).
+* `index.html`: every graph side by side.
+  * For a split LLM (Gemma 4): end-to-end decode and prefill rates summed from the parts, next to
+    Qualcomm's published numbers.
+  * AI Hub time, peak memory and published time; QHAS time, HTP utilization, inferences per second,
+    DRAM/VTCM bytes and average GB/s.
+  * **What sets the run time**: critical-path share by unit (HMX / HVX / DMA / sync / …) and by QNN op type.
+  * **Where the work goes**: op cycles summed over all HTP threads, by unit.
 * `<graph>.html`, one page per graph:
   * **Overall summary per HTP core**: Qualcomm's "% of overall timeline HTP utilization", inferences per
     second, time, timeline cycles, DRAM and VTCM read/write.
+  * **AI Hub profile summary**: inference time, peak memory, layers per compute unit, first and warm load
+    time, run-to-run spread, and the published figure when there is one.
   * **Resource utilization**: HMX and HVX per HTP thread.
-  * **HTP op instances by unit**: share of all op cycles.
+  * **By unit**: critical-path share (what sets the run time) and op-cycle share (where the work goes).
   * **QNN op types and nodes**: cycles, % active cycles, HTP ops, DRAM/VTCM traffic, % on the critical path.
   * **HTP op types**: reference ops (scalar code) and format changes flagged.
   * **Critical (dominant) path ops** and the **slowest HTP op instances**, with time and DRAM GB/s.
@@ -313,6 +320,10 @@ export, `<component>/` for a SigLIP 2 run), attaches AI Hub's `<graph>.profile.j
     and time by op name.
   * **AI Hub per-layer profile**: slowest layers and compute unit.
 * `<graph>/*.csv`: every table, for your own plots; `summary.json`: headline numbers of every graph.
+
+Optrace timestamps are not always in µs. The report finds their unit by matching the trace's span
+against the QHAS run of the same graph (in HTP cycles, µs or ns), converts to µs, and says which it
+used. If nothing matches, times stay in the file's own units, with a warning.
 
 Each chart has hover tooltips and a table view, and the pages work offline in light and dark mode.
 Open `index.html` in a browser; copy the whole `hw_report/` folder to view it elsewhere.

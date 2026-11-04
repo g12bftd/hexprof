@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from hexprof.aihub.metrics import aihub_metrics
 from hexprof.hwreport import html as H
 from hexprof.hwreport import optrace as OT
 from hexprof.hwreport import qhas as QH
@@ -30,7 +31,13 @@ QHAS_DEFS = {
                  "“Percentage of utilization of this resource”; the table also lists the cycles the resource was used "
                  "(cycles_used) out of the timeline cycles.",
     "kinds": "Every executed HTP op instance, assigned once to the first unit it used in this order: HMX (matrix unit), "
-             "HVX (vector units), reference op (scalar code, slow), format change, DMA wait, sync, DMA. Share of all op cycles.",
+             "HVX (vector units), reference op (scalar code, slow), format change, DMA wait, sync, DMA. “Work” = op cycles "
+             "summed over all HTP threads. Several threads run vector (HVX) ops at the same time, while there is one matrix "
+             "unit (HMX), so this shows where the work goes, not where the time goes.",
+    "critical": "The same ops, counting only their cycles on the critical (dominant) path: the chain of ops that sets the "
+                "run time. This is the wall-time view: a unit with a large share here is what to speed up.",
+    "qnn_dp": "Share of the critical path per QNN op type (Qualcomm's num_dominant_path_cycles): the op types that set the "
+              "run time. Compare with the work view above: an op type can do a lot of work in parallel without being on it.",
     "qnn": "QNN ops are the graph operations you exported; each lowers to one or more HTP ops. Cycles = total clock cycles "
            "spent in that op type; % active cycles = cycles actively executing out of its total (Qualcomm).",
     "mem": "Bytes moved between the HTP and DRAM (main memory) per QNN op type. VTCM is the HTP's on-chip memory.",
@@ -49,6 +56,7 @@ class Graph:
     qhas: Path | None = None
     optrace: Path | None = None
     profile: Path | None = None
+    published: dict[str, Any] | None = None  # AI Hub's published figures for this component, when known
     out: dict[str, Any] = field(default_factory=dict)
 
 
@@ -69,6 +77,16 @@ def discover(paths: Sequence[str | Path]) -> list[Graph]:
             graphs.setdefault(QH.label_of(f), Graph(QH.label_of(f))).qhas = f
         elif any(t in name for t in ("profile_trace", "optrace", "chrometrace")) or folder == "optrace":
             graphs.setdefault(OT.label_of(f), Graph(OT.label_of(f))).optrace = f  # <job>_main_profile_trace.json
+    for r in roots:
+        for pj in r.rglob("profile.json"):
+            try:
+                d = json.loads(pj.read_text()) if pj.stat().st_size < 20 * 2**20 else None
+            except (OSError, ValueError):
+                d = None
+            comps = d.get("components") if isinstance(d, dict) else None
+            for comp, rec in (comps or {}).items():
+                if comp in graphs and isinstance(rec, dict) and rec.get("published"):
+                    graphs[comp].published = {**rec["published"], "what": f"{d.get('precision')}, {d.get('runtime')}"}
     for g in graphs.values():
         for r in roots:
             hit = next(iter(sorted(r.rglob(f"{g.label}.profile.json"))), None)
@@ -138,6 +156,14 @@ def _kind_color(kind: str) -> str:
     return f"var(--s{KINDS.index(k) + 1})" if k in KINDS[:-1] else "var(--other)"
 
 
+def _ms(v: Any) -> str:
+    return "–" if v is None else f"{float(v):.3f} ms"
+
+
+def _mb(r: Any) -> str:
+    return f"{r.get('min')}–{r.get('max')} MB" if isinstance(r, dict) else "–"
+
+
 def _fmt_bytes(v: Any) -> str:
     v = _n(v)
     for unit, d in (("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
@@ -169,7 +195,9 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
         warnings += rep.warnings
         k = QH.overall_kpis(rep)
         summary["qhas"] = {"version": rep.version, "kpis": k, "by_kind": rep.instances.get("by_kind"),
-                           "op_instances": rep.instances.get("count")}
+                           "op_instances": rep.instances.get("count"),
+                           "qnn_op_types": [{"op": r.get("op"), "cycles": _n(r.get("cycles")),
+                                             "dp_cycles": _n(r.get("dominant_path_cycles"))} for r in rep.qnn_op_types]}
         tiles += [
             {"label": "HTP utilization", "value": f"{k['percent_utilization']:.1f}%" if k.get("percent_utilization") is not None else "–",
              "sub": "share of the run the NPU was busy"},
@@ -226,16 +254,26 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                       "color": _kind_color(k),
                       "extra": [["cycles", _fmt_n(v["cycles"])], ["op instances", _fmt_n(v["count"])],
                                 ["DRAM bytes", _fmt_bytes(v["dram_bytes"])]]} for k, v in kinds]
-            ktable = [{"kind": k, "share": 100 * v["cycles"] / total if total else 0.0, **v} for k, v in kinds]
+            dptot = sum(v.get("dp_cycles", 0.0) for _, v in kinds)
+            ktable = [{"kind": k, "share": 100 * v["cycles"] / total if total else 0.0,
+                       "dp_share": 100 * v.get("dp_cycles", 0.0) / dptot if dptot else None, **v} for k, v in kinds]
+            dprows = [{"label": k, "value": 100 * v.get("dp_cycles", 0.0) / dptot, "color": _kind_color(k),
+                       "extra": [["critical-path cycles", _fmt_n(v.get("dp_cycles"))]]}
+                      for k, v in sorted(kinds, key=lambda kv: -kv[1].get("dp_cycles", 0.0))] if dptot else []
             types = sorted(inst.get("by_type", {}).items(), key=lambda kv: -kv[1]["cycles"])
             ttable = [{"type": t, "share": 100 * v["cycles"] / total if total else 0.0, **v} for t, v in types]
             _csv(csv_dir / "htp_instances_by_kind.csv", ktable)
             _csv(csv_dir / "htp_instances_by_type.csv", ttable)
-            sections.append({"title": "Where the cycles go: HTP op instances by unit", "why": QHAS_DEFS["kinds"],
-                             "blocks": [{"type": "hbar", "rows": krows, "kind": "pct", "title": "cycles by unit",
+            if dprows:
+                sections.append({"title": "What sets the run time: critical path by unit", "why": QHAS_DEFS["critical"],
+                                 "blocks": [{"type": "hbar", "rows": dprows, "kind": "pct", "title": "critical path by unit"}]})
+            sections.append({"title": "Where the work goes: HTP op instances by unit", "why": QHAS_DEFS["kinds"],
+                             "blocks": [{"type": "hbar", "rows": krows, "kind": "pct", "title": "op cycles by unit",
                                          "table": {"cols": [{"key": "kind", "label": "Unit", "kind": "str"},
-                                                            {"key": "share", "label": "% of cycles", "kind": "pct"},
+                                                            {"key": "share", "label": "% of op cycles", "kind": "pct"},
+                                                            {"key": "dp_share", "label": "% of critical path", "kind": "pct"},
                                                             {"key": "cycles", "label": "Cycles", "kind": "num"},
+                                                            {"key": "dp_cycles", "label": "Critical-path cycles", "kind": "num"},
                                                             {"key": "count", "label": "Op instances", "kind": "num"},
                                                             {"key": "dram_bytes", "label": "DRAM bytes", "kind": "bytes"}],
                                                    "rows": ktable}},
@@ -247,9 +285,11 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                                                    "rows": ttable}}]})
         if rep.qnn_op_types:
             qtot = sum(_n(r.get("cycles")) for r in rep.qnn_op_types)
+            qdp = sum(_n(r.get("dominant_path_cycles")) for r in rep.qnn_op_types)
             _csv(csv_dir / "qnn_op_types.csv", rep.qnn_op_types)
             _csv(csv_dir / "qnn_op_instances.csv", rep.qnn_op_instances)
             sections.append({"title": "QNN op types", "why": QHAS_DEFS["qnn"], "blocks": [
+                {"type": "note", "text": "Work (op cycles summed over threads):"},
                 {"type": "hbar", "kind": "pct", "title": "cycles by QNN op type",
                  "rows": _share_rows(rep.qnn_op_types, "cycles", qtot, lambda r: str(r.get("op")), top,
                                      lambda r: [["cycles", _fmt_n(r.get("cycles"))],
@@ -267,6 +307,13 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                                     {"key": "vtcm_write", "label": "VTCM write", "kind": "bytes"},
                                     {"key": "dominant_path_percent", "label": "% critical path", "kind": "pct"}],
                            "rows": rep.qnn_op_types}},
+                *([{"type": "note", "text": "Critical path (wall-time view): " + QHAS_DEFS["qnn_dp"]},
+                   {"type": "hbar", "kind": "pct", "title": "critical path by QNN op type",
+                    "rows": _share_rows(sorted(rep.qnn_op_types, key=lambda r: -_n(r.get("dominant_path_cycles"))),
+                                        "dominant_path_cycles", qdp, lambda r: str(r.get("op")), top,
+                                        lambda r: [["critical-path cycles", _fmt_n(r.get("dominant_path_cycles"))],
+                                                   ["share of work", f"{100 * _n(r.get('cycles')) / qtot:.1f}%" if qtot else "–"]])}]
+                  if qdp else []),
                 {"type": "note", "text": f"QNN op instances (nodes), slowest {min(200, len(rep.qnn_op_instances))}:",
                  "table": {"cols": [{"key": "qnn_op", "label": "QNN op", "kind": "str"},
                                     {"key": "cycles", "label": "Cycles", "kind": "num"},
@@ -342,26 +389,36 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                                                    "rows": inst["timeline"]["lanes"]}}]})
     if g.optrace:
         ot = OT.load(g.optrace, bins=bins)
-        summary["optrace"] = {"events": ot.events, "span_us": ot.span_us, "lanes": ot.lanes,
+        kq = summary.get("qhas", {}).get("kpis", {})
+        OT.calibrate(ot, kq.get("timeline_cycles"), kq.get("time_us"))
+        tk = "us" if ot.unit == "µs" else "num"
+
+        def tfmt(v: float, ms: bool = False) -> str:
+            if ot.unit != "µs":
+                return f"{v:.4g} {ot.unit}"
+            return f"{v / 1e3:.3f} ms" if ms else f"{v:.2f} µs"
+
+        summary["optrace"] = {"events": ot.events, "span_us": ot.span_us, "unit": ot.unit, "unit_note": ot.unit_note,
+                              "raw_span": ot.raw_span, "declared_unit": ot.declared_unit, "lanes": ot.lanes,
                               "counters": [{k: v for k, v in c.items() if k != "series"} for c in ot.counters],
                               "top_ops": ot.ops[:50]}
         _csv(csv_dir / "optrace_threads.csv", ot.lanes)
         _csv(csv_dir / "optrace_ops.csv", ot.ops)
         _csv(csv_dir / "optrace_counters.csv", [{k: v for k, v in c.items() if k != "series"} for c in ot.counters])
         if not g.qhas:
-            tiles += [{"label": "Trace span", "value": f"{(ot.span_us or 0) / 1e3:.2f} ms", "sub": f"{_fmt_n(ot.events)} events"}]
+            tiles += [{"label": "Trace span", "value": tfmt(ot.span or 0, ms=True), "sub": f"{_fmt_n(ot.events)} events"}]
         blocks: list[dict[str, Any]] = []
         if ot.lanes:
             lrows = sorted(ot.lanes, key=lambda r: -(r["busy_share"] or 0))
             blocks.append({"type": "hbar", "kind": "frac", "max": 1, "title": "busy share per thread",
                            "rows": [{"label": r["name"], "value": r["busy_share"],
-                                     "extra": [["busy", f"{r['busy_us'] / 1e3:.2f} ms"], ["slices", _fmt_n(r["slices"])]]} for r in lrows],
+                                     "extra": [["busy", tfmt(r["busy_us"], ms=True)], ["slices", _fmt_n(r["slices"])]]} for r in lrows],
                            "table": {"cols": [{"key": "name", "label": "Thread", "kind": "str"},
                                               {"key": "busy_share", "label": "Busy share", "kind": "frac"},
-                                              {"key": "busy_us", "label": "Busy", "kind": "us"},
+                                              {"key": "busy_us", "label": "Busy", "kind": tk},
                                               {"key": "slices", "label": "Slices", "kind": "num"}], "rows": lrows}})
         sections.append({"title": "Optrace: busy share per thread",
-                         "why": f"{_fmt_n(ot.events)} trace events over {(ot.span_us or 0) / 1e3:.2f} ms (trace time units: µs). "
+                         "why": f"{_fmt_n(ot.events)} trace events over {tfmt(ot.span or 0, ms=True)}. {ot.unit_note} "
                                 "Busy share = time covered by top-level op slices on the thread ÷ trace span.",
                          "blocks": blocks or [{"type": "note", "text": "No op slices found."}]})
         if ot.timeline:
@@ -369,12 +426,12 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                              "blocks": [{"type": "lanes", "timeline": ot.timeline, "title": "optrace occupancy",
                                          "table": {"cols": [{"key": "name", "label": "Thread", "kind": "str"},
                                                             {"key": "busy_share", "label": "Busy share", "kind": "frac"},
-                                                            {"key": "busy_us", "label": "Busy", "kind": "us"}],
+                                                            {"key": "busy_us", "label": "Busy", "kind": tk}],
                                                    "rows": ot.lanes}}]})
         if ot.counters:
             cblocks: list[dict[str, Any]] = []
             for c in ot.counters[:6]:
-                cblocks.append({"type": "line", "points": c["series"], "kind": "num", "title": c["name"],
+                cblocks.append({"type": "line", "points": c["series"], "kind": "num", "title": c["name"], "xunit": ot.unit,
                                 "subtitle": f"{c['name']} ({c['process']}): mean {c['time_weighted_mean']:.4g}, "
                                             f"min {c['min']:.4g}, max {c['max']:.4g}, {c['points']} samples"})
             cblocks[-1]["table"] = {"cols": [{"key": "process", "label": "Process", "kind": "str"},
@@ -394,26 +451,53 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int) -> dict[str, Any]:
                              "nesting levels.", "blocks": [
                                  {"type": "hbar", "kind": "pct", "title": "time by op name",
                                   "rows": _share_rows(ot.ops, "total_us", ttot, lambda r: r["name"], top,
-                                                      lambda r: [["total", f"{r['total_us'] / 1e3:.3f} ms"], ["count", _fmt_n(r["count"])],
-                                                                 ["mean", f"{r['mean_us']:.2f} µs"], ["max", f"{r['max_us']:.2f} µs"]]),
+                                                      lambda r: [["total", tfmt(r["total_us"], ms=True)], ["count", _fmt_n(r["count"])],
+                                                                 ["mean", tfmt(r["mean_us"])], ["max", tfmt(r["max_us"])]]),
                                   "table": {"cols": [{"key": "name", "label": "Op", "kind": "str"},
-                                                     {"key": "total_us", "label": "Total", "kind": "us"},
+                                                     {"key": "total_us", "label": "Total", "kind": tk},
                                                      {"key": "count", "label": "Count", "kind": "num"},
-                                                     {"key": "mean_us", "label": "Mean", "kind": "us"},
-                                                     {"key": "max_us", "label": "Max", "kind": "us"}], "rows": ot.ops[:500]}}]})
+                                                     {"key": "mean_us", "label": "Mean", "kind": tk},
+                                                     {"key": "max_us", "label": "Max", "kind": tk}], "rows": ot.ops[:500]}}]})
+        if ot.unit != "µs":
+            warnings.append(ot.unit_note)
         if ot.other_phases:  # instant / flow / async markers carry no duration or value
             sections[-1]["blocks"].append({"type": "note", "text": "Other trace events (markers, not timed): " +
                                            ", ".join(f"{n:,} × ph={k!r}" for k, n in sorted(ot.other_phases.items()))})
     if g.profile:
         prof = json.loads(Path(g.profile).read_text())
         layers = sorted(prof.get("execution_detail", []), key=lambda r: -_n(r.get("execution_time")))
-        es = prof.get("execution_summary", {})
-        summary["aihub"] = {"inference_time_ms": _n(es.get("estimated_inference_time")) / 1e3}
-        units: dict[str, int] = {}
-        for r in layers:
-            units[str(r.get("compute_unit"))] = units.get(str(r.get("compute_unit")), 0) + 1
-        tiles.append({"label": "AI Hub inference time", "value": f"{_n(es.get('estimated_inference_time')) / 1e3:.2f} ms",
-                      "sub": ", ".join(f"{k} {v}" for k, v in sorted(units.items())) + " layers"})
+        m = aihub_metrics(prof) if prof.get("execution_summary") else {}
+        summary["aihub"] = {**m, "inference_time_ms": m.get("inference_time_milliseconds"), "published": g.published}
+        lc, pk = m.get("layer_counts") or {}, m.get("estimated_peak_memory_range_mb") or {}
+        pub = g.published or {}
+        tiles.append({"label": "AI Hub inference time",
+                      "value": f"{m['inference_time_milliseconds']:.3f} ms" if m.get("inference_time_milliseconds") else "–",
+                      "sub": (f"published {pub['inference_time_milliseconds']} ms" if pub.get("inference_time_milliseconds")
+                              else ", ".join(f"{k.upper()} {v}" for k, v in lc.items() if k != "total" and v) + " layers")})
+        if pk:
+            tiles.append({"label": "AI Hub peak memory", "value": f"{pk.get('min')}–{pk.get('max')} MB",
+                          "sub": f"{lc.get('npu', 0)} of {lc.get('total', 0)} layers on the NPU"})
+        rows_m = [{"metric": "Inference time", "value": _ms(m.get("inference_time_milliseconds")),
+                   "published": _ms(pub.get("inference_time_milliseconds"))},
+                  {"metric": "Peak memory (inference)", "value": _mb(pk), "published": _mb(pub.get("estimated_peak_memory_range_mb"))},
+                  {"metric": "Layers on NPU / GPU / CPU", "value": f"{lc.get('npu', 0)} / {lc.get('gpu', 0)} / {lc.get('cpu', 0)}",
+                   "published": f"{pub['layer_counts'].get('npu', 0)} / {pub['layer_counts'].get('total', 0)} total"
+                   if isinstance(pub.get("layer_counts"), dict) else "–"},
+                  {"metric": "First load time", "value": _ms(m.get("first_load_time_milliseconds")), "published": "–"},
+                  {"metric": "Warm load time", "value": _ms(m.get("warm_load_time_milliseconds")), "published": "–"},
+                  {"metric": "First / warm load peak memory",
+                   "value": f"{_mb(m.get('first_load_peak_memory_range_mb'))} / {_mb(m.get('warm_load_peak_memory_range_mb'))}",
+                   "published": "–"}]
+        spread = m.get("all_inference_times_milliseconds") or {}
+        if spread.get("n"):
+            rows_m.append({"metric": f"Spread over {spread['n']} runs (min / median / max)",
+                           "value": f"{spread['min']:.3f} / {spread['median']:.3f} / {spread['max']:.3f} ms", "published": "–"})
+        sections.append({"title": "AI Hub profile summary", "why": "AI Hub's own measurement of this graph (what Workbench shows "
+                         "on the job page), next to AI Hub's published figure when one exists"
+                         + (f" ({pub.get('what')}, job {pub.get('job_id')})." if pub else "."),
+                         "blocks": [{"type": "note", "text": "", "table": {"open": True, "cols": [
+                             {"key": "metric", "label": "Metric", "kind": "str"}, {"key": "value", "label": "This job", "kind": "str"},
+                             {"key": "published", "label": "Published", "kind": "str"}], "rows": rows_m}}]})
         if layers and any(r.get("execution_time") is not None for r in layers):
             _csv(csv_dir / "aihub_layers.csv", layers)
             sections.append({"title": "AI Hub per-layer profile", "why": "AI Hub's own per-layer timing (Runtime Layer Analysis) "
@@ -448,56 +532,154 @@ def _instance_cols() -> list[dict[str, str]]:
 # --------------------------------------------------------------------------- overview
 
 
-def overview_page(graphs: list[Graph], title: str) -> dict[str, Any]:
+def llm_rollup(graphs: list[Graph]) -> dict[str, dict[str, Any]]:
+    """Sum the parts of split LLM graphs (``part_i_of_n__{prompt|token}_ar.._cl..``) into per-step times."""
+    groups: dict[tuple[str, int, int], dict[int, tuple[int, Graph]]] = {}
+    for g in graphs:
+        m = _GRAPH.match(g.label)
+        if m:
+            groups.setdefault((m["kind"], int(m["ar"]), int(m["cl"])), {})[int(m["i"])] = (int(m["n"]), g)
+    out: dict[str, dict[str, Any]] = {}
+    for (kind, ar, cl), parts in groups.items():
+        n = next(iter(parts.values()))[0]
+        if sorted(parts) != list(range(1, n + 1)):
+            continue
+        ah = [p[1].out.get("aihub", {}).get("inference_time_ms") for p in parts.values()]
+        qh = [p[1].out.get("qhas", {}).get("kpis", {}).get("time_us") for p in parts.values()]
+        out[kind] = {"ar": ar, "cl": cl, "parts": n, "aihub_ms": sum(ah) if all(ah) else None,
+                     "qhas_ms": sum(qh) / 1e3 if all(qh) else None}
+    return out
+
+
+def _published_llm(cl: int) -> dict[str, Any] | None:
+    try:
+        from hexprof.reference import published_gemma4_llm_metric
+
+        return published_gemma4_llm_metric(cl, "npu")
+    except Exception:  # noqa: BLE001 - reference data is optional
+        return None
+
+
+def _stack_rows(graphs: list[Graph], key: str) -> list[dict[str, Any]]:
     rows = []
     for g in graphs:
-        q = g.out.get("qhas", {})
-        k = q.get("kpis", {})
-        rows.append({"label": short_label(g.label), "folder": g.label, "href": f"{g.label}.html", "time_ms": (k.get("time_us") or 0) / 1e3 if k.get("time_us") else None,
-                     "util": k.get("percent_utilization"), "ips": k.get("inf_per_s"), "dram": k.get("total_dram"),
-                     "dram_gbps": k.get("dram_gbps"), "vtcm": k.get("total_vtcm"),
-                     "aihub_ms": g.out.get("aihub", {}).get("inference_time_ms"),
-                     "trace_ms": (g.out.get("optrace", {}).get("span_us") or 0) / 1e3 if g.out.get("optrace") else None})
-    sections: list[dict[str, Any]] = [{"title": "Graphs", "why": "One row per compiled graph. Click a name for its full report.",
-                                       "blocks": [{"type": "note", "text": "Time and utilization from QHAS; AI Hub time from the profile job.",
-                                                   "table": {"open": True, "cols": [
-                                                       {"key": "label", "label": "Graph", "kind": "str", "link": "href"},
-                                                       {"key": "time_ms", "label": "QHAS ms", "kind": "num"},
-                                                       {"key": "aihub_ms", "label": "AI Hub ms", "kind": "num"},
-                                                       {"key": "util", "label": "Util %", "kind": "pct"},
-                                                       {"key": "ips", "label": "IPS", "kind": "num"},
-                                                       {"key": "dram", "label": "DRAM", "kind": "bytes"},
-                                                       {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"},
-                                                       {"key": "vtcm", "label": "VTCM", "kind": "bytes"},
-                                                       {"key": "trace_ms", "label": "Trace ms", "kind": "num"},
-                                                       {"key": "folder", "label": "Folder", "kind": "str"}],
-                                                       "rows": rows}}]}]
-    for key, title_, kind, why in (("time_ms", "Run time per graph (ms)", "num", "QHAS run time of one inference."),
-                                   ("util", "HTP utilization per graph", "pct", QHAS_DEFS["util"]),
-                                   ("dram_gbps", "Average DRAM bandwidth per graph (GB/s)", "num",
-                                    "DRAM bytes moved ÷ run time. Compare with the measured bandwidth ceiling.")):
-        data = [{"label": r["label"], "value": r[key]} for r in rows if r.get(key) is not None]
-        if data:
-            sections.append({"title": title_, "why": why, "blocks": [{"type": "hbar", "rows": data, "kind": kind,
-                                                                        "max": 100 if kind == "pct" else None, "title": title_}]})
-    kind_rows = []
-    for g in graphs:
         bk = g.out.get("qhas", {}).get("by_kind") or {}
-        tot = sum(v["cycles"] for v in bk.values())
+        tot = sum(v.get(key, 0.0) for v in bk.values())
         if tot:
             merged = dict.fromkeys(KINDS, 0.0)
             for k, v in bk.items():
                 k2 = "DMA" if k == "DMA set" else (k if k in merged else "Other")
-                merged[k2] += 100 * v["cycles"] / tot
-            kind_rows.append({"label": short_label(g.label), "values": [merged[k] for k in KINDS]})
-    if kind_rows:
-        sections.append({"title": "Where the cycles go, per graph", "why": QHAS_DEFS["kinds"], "blocks": [
-            {"type": "stacked", "rows": kind_rows, "series": KINDS, "kind": "pct", "max": 100, "title": "cycles by unit",
-             "table": {"cols": [{"key": "label", "label": "Graph", "kind": "str"}] +
-                       [{"key": k, "label": k, "kind": "pct"} for k in KINDS],
-                       "rows": [{"label": r["label"], **dict(zip(KINDS, r["values"]))} for r in kind_rows]}}]})
+                merged[k2] += 100 * v.get(key, 0.0) / tot
+            rows.append({"label": short_label(g.label), "values": [merged[k] for k in KINDS]})
+    return rows
+
+
+def _stack_block(rows: list[dict[str, Any]], series: list[str], title: str) -> dict[str, Any]:
+    return {"type": "stacked", "rows": rows, "series": series, "kind": "pct", "max": 100, "title": title,
+            "table": {"cols": [{"key": "label", "label": "Graph", "kind": "str"}] + [{"key": k, "label": k, "kind": "pct"} for k in series],
+                      "rows": [{"label": r["label"], **dict(zip(series, r["values"]))} for r in rows]}}
+
+
+def overview_page(graphs: list[Graph], title: str) -> dict[str, Any]:
+    rows = []
+    for g in graphs:
+        k = g.out.get("qhas", {}).get("kpis", {})
+        ah = g.out.get("aihub", {})
+        pk = ah.get("estimated_peak_memory_range_mb") or {}
+        ot = g.out.get("optrace") or {}
+        rows.append({"label": short_label(g.label), "folder": g.label, "href": f"{g.label}.html",
+                     "time_ms": k["time_us"] / 1e3 if k.get("time_us") else None,
+                     "util": k.get("percent_utilization"), "ips": k.get("inf_per_s"), "dram": k.get("total_dram"),
+                     "dram_gbps": k.get("dram_gbps"), "vtcm": k.get("total_vtcm"),
+                     "aihub_ms": ah.get("inference_time_ms"), "peak_mb": pk.get("max"),
+                     "published_ms": (g.published or {}).get("inference_time_milliseconds"),
+                     "trace_ms": ot["span_us"] / 1e3 if ot.get("span_us") else None})
+    tiles: list[dict[str, Any]] = []
+    blocks_e2e: list[dict[str, Any]] = []
+    roll = llm_rollup(graphs)
+    tok, pre = roll.get("token"), roll.get("prompt")
+    if tok and tok.get("aihub_ms"):
+        tiles.append({"label": "Decode (AI Hub)", "value": f"{1e3 / tok['aihub_ms']:.1f} tok/s",
+                      "sub": f"{tok['parts']} token graphs, {tok['aihub_ms']:.1f} ms per token"
+                             + (f"; QHAS {1e3 / tok['qhas_ms']:.1f} tok/s" if tok.get("qhas_ms") else "")})
+    if pre and pre.get("aihub_ms"):
+        tiles.append({"label": "Prefill (AI Hub)", "value": f"{pre['ar'] * 1e3 / pre['aihub_ms']:.0f} tok/s",
+                      "sub": f"{pre['ar']}-token chunk in {pre['aihub_ms']:.1f} ms"
+                             + (f"; QHAS {pre['ar'] * 1e3 / pre['qhas_ms']:.0f} tok/s" if pre.get("qhas_ms") else "")})
+    vis = [g for g in graphs if "vision" in g.label.lower() and g.out.get("aihub", {}).get("inference_time_ms")]
+    for g in vis:
+        tiles.append({"label": "Vision encoder (AI Hub)", "value": f"{g.out['aihub']['inference_time_ms']:.0f} ms",
+                      "sub": "per image"})
+    if tok or pre:
+        cl = (tok or pre)["cl"]
+        pub = _published_llm(cl)
+        text = ("Sums of the parts, each profiled on its own: switching between graphs, embedding lookups and sampling "
+                "on the CPU are not included, so an end-to-end run is somewhat slower.")
+        if pub:
+            text += (f" Qualcomm publishes Gemma 4 E4B on the S25 NPU only for a different runtime and precision "
+                     f"(q4_0 through llama.cpp/GenieX), at {cl} context: decode {pub['tokens_per_second']:.2f} tok/s, "
+                     f"prefill {pub['prefill_tokens_per_second']:.0f} tok/s, time to first token from "
+                     f"{pub['time_to_first_token_range_milliseconds']['min']:.0f} ms. Same ballpark expected, not equality.")
+        blocks_e2e.append({"type": "note", "text": text})
+    sections: list[dict[str, Any]] = []
+    if blocks_e2e:
+        sections.append({"title": "End to end (from the parts)", "why": "Decode = 1 ÷ (sum of the token graphs); prefill = "
+                         "chunk length ÷ (sum of the prompt graphs).", "blocks": blocks_e2e})
+    cols = [{"key": "label", "label": "Graph", "kind": "str", "link": "href"},
+            {"key": "aihub_ms", "label": "AI Hub ms", "kind": "num"}]
+    if any(r["published_ms"] for r in rows):
+        cols.append({"key": "published_ms", "label": "Published ms", "kind": "num"})
+    cols += [{"key": "time_ms", "label": "QHAS ms", "kind": "num"},
+             {"key": "util", "label": "Util %", "kind": "pct"},
+             {"key": "ips", "label": "IPS", "kind": "num"},
+             {"key": "dram", "label": "DRAM", "kind": "bytes"},
+             {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"},
+             {"key": "vtcm", "label": "VTCM", "kind": "bytes"},
+             {"key": "peak_mb", "label": "Peak MB", "kind": "num"},
+             {"key": "trace_ms", "label": "Trace ms", "kind": "num"},
+             {"key": "folder", "label": "Folder", "kind": "str"}]
+    sections.append({"title": "Graphs", "why": "One row per compiled graph. Click a name for its full report.",
+                     "blocks": [{"type": "note", "text": "AI Hub ms and peak memory: AI Hub's profile job (what Workbench "
+                                 "shows). QHAS ms, utilization, inferences per second and memory traffic: the QHAS file "
+                                 "of the detailed profiling run. Trace ms: optrace span, converted to ms.",
+                                 "table": {"open": True, "cols": cols, "rows": rows}}]})
+    for key, title_, kind, why in (("aihub_ms", "Run time per graph (AI Hub, ms)", "num", "AI Hub's inference time of one run."),
+                                   ("util", "HTP utilization per graph", "pct", QHAS_DEFS["util"]),
+                                   ("dram_gbps", "Average DRAM bandwidth per graph (GB/s)", "num",
+                                    "DRAM bytes moved ÷ QHAS run time. The S25's memory peak is 84.8 GB/s in theory "
+                                    "(LPDDR5X-5300, 64-bit); compare with the measured bandwidth ceiling.")):
+        data = [{"label": r["label"], "value": r[key]} for r in rows if r.get(key) is not None]
+        if data:
+            sections.append({"title": title_, "why": why, "blocks": [{"type": "hbar", "rows": data, "kind": kind,
+                                                                        "max": 100 if kind == "pct" else None, "title": title_}]})
+    dp_rows = _stack_rows(graphs, "dp_cycles")
+    if dp_rows:
+        sections.append({"title": "What sets the run time: critical path by unit, per graph", "why": QHAS_DEFS["critical"],
+                         "blocks": [_stack_block(dp_rows, KINDS, "critical path by unit")]})
+    work_rows = _stack_rows(graphs, "cycles")
+    if work_rows:
+        sections.append({"title": "Where the work goes: op cycles by unit, per graph", "why": QHAS_DEFS["kinds"],
+                         "blocks": [_stack_block(work_rows, KINDS, "op cycles by unit")]})
+    # critical path by QNN op type: the 7 op types with the largest share anywhere keep their colour on every graph
+    shares: dict[str, dict[str, float]] = {}
+    for g in graphs:
+        ts = g.out.get("qhas", {}).get("qnn_op_types") or []
+        tot = sum(t["dp_cycles"] for t in ts)
+        if tot:
+            shares[g.label] = {str(t["op"]): 100 * t["dp_cycles"] / tot for t in ts}
+    if shares:
+        best: dict[str, float] = {}
+        for sh in shares.values():
+            for op, v in sh.items():
+                best[op] = max(best.get(op, 0.0), v)
+        keep = [op for op, _ in sorted(best.items(), key=lambda kv: -kv[1])[:7]]
+        series = keep + ["Other"]
+        op_rows = [{"label": short_label(lbl), "values": [sh.get(op, 0.0) for op in keep] + [sum(v for op, v in sh.items() if op not in keep)]}
+                   for lbl, sh in shares.items()]
+        sections.append({"title": "What sets the run time: critical path by QNN op type, per graph", "why": QHAS_DEFS["qnn_dp"],
+                         "blocks": [_stack_block(op_rows, series, "critical path by QNN op type")]})
     return {"title": title, "subtitle": f"{len(graphs)} graph(s): QHAS summaries, optrace timelines and AI Hub profiles.",
-            "sections": sections,
+            "tiles": tiles, "sections": sections,
             "footer": "Generated by hexprof hw report. Definitions quoted from Qualcomm's QAIRT Visualizer."}
 
 

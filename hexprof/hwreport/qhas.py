@@ -194,8 +194,9 @@ def _aggregate_instances(path: str, top_n: int, bins: int, rep: QhasReport, prog
     """Single streaming pass over htp_op_instances (can be millions of rows)."""
     count = 0
     total_cycles = 0.0
-    by_kind: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "cycles": 0.0, "dram_bytes": 0.0})
-    by_type: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "cycles": 0.0})
+    by_kind: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "cycles": 0.0, "dram_bytes": 0.0,
+                                                                "dp_cycles": 0.0})
+    by_type: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "cycles": 0.0, "dp_cycles": 0.0})
     kt_cache: dict[tuple[bool, ...], tuple[str, str]] = {}
     lanes: dict[str, int] = {}
     starts, cycles_arr, lane_idx = array("d"), array("d"), array("i")
@@ -213,9 +214,12 @@ def _aggregate_instances(path: str, top_n: int, bins: int, rep: QhasReport, prog
         k["count"] += 1
         k["cycles"] += c
         k["dram_bytes"] += (num(r.get("dram_read")) or 0.0) + (num(r.get("dram_write")) or 0.0)
+        dpc = num(r.get("num_dominant_path_cycles")) or 0.0
+        k["dp_cycles"] += dpc
         t = by_type[typ]
         t["count"] += 1
         t["cycles"] += c
+        t["dp_cycles"] += dpc
         lane = f"HTP {r.get('htp', 0)} · TID {r.get('tid', '?')}"
         li = lanes.setdefault(lane, len(lanes))
         s = num(r.get("start_cycle"))

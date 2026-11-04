@@ -59,7 +59,7 @@ a { color: var(--s1); }
 .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-top: 16px; }
 .card h2 { font-size: 16px; font-weight: 600; margin: 0 0 2px; }
 .card .why { color: var(--text-secondary); margin: 0 0 12px; font-size: 13px; max-width: 900px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 16px; }
 .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
 .tile .label { color: var(--text-secondary); font-size: 12px; }
 .tile .value { font-size: 24px; font-weight: 600; margin-top: 2px; }
@@ -240,6 +240,7 @@ function stacked(parent, rows, series, o) {
 function line(parent, pts, o) {
   o = o || {}; const f = fmtBy(o.kind), W = chartW(parent), H = 220, L = 64, R = 16, T = 10, B = 26;
   if (!pts.length) { txt("p", "No samples.", parent, "note"); return; }
+  const xf = !o.xunit || o.xunit === "µs" ? F.us : (v => F.num(v) + " " + o.xunit);
   const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]), x0 = xs[0], x1 = xs[xs.length - 1] || x0 + 1;
   const yMax = Math.max(1e-12, ...pts.map(p => p.length > 2 ? p[2] : p[1])), ticks = niceTicks(yMax, 4), yTop = ticks[ticks.length - 1];
   const X = v => L + (W - L - R) * ((v - x0) / Math.max(1e-12, x1 - x0)), Y = v => T + (H - T - B) * (1 - v / yTop);
@@ -247,7 +248,7 @@ function line(parent, pts, o) {
   for (const t of ticks) { sv("line", {x1: L, x2: W - R, y1: Y(t), y2: Y(t), class: "grid"}, s);
     sv("text", {x: L - 6, y: Y(t) + 4, "text-anchor": "end", class: "axis"}, s).textContent = f(t); }
   for (const t of niceTicks(x1 - x0, 5)) { if (x0 + t > x1) break;
-    sv("text", {x: X(x0 + t), y: H - 6, "text-anchor": edgeAnchor(X(x0 + t), W), class: "axis"}, s).textContent = F.us(t); }
+    sv("text", {x: X(x0 + t), y: H - 6, "text-anchor": edgeAnchor(X(x0 + t), W), class: "axis"}, s).textContent = xf(t); }
   let d = ""; pts.forEach((p, i) => { d += (i ? "L" : "M") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1); });
   sv("path", {d: d + `L${X(x1)},${Y(0)}L${X(x0)},${Y(0)}Z`, fill: o.color || SLOTS[0], opacity: 0.1}, s);
   sv("path", {d: d, fill: "none", stroke: o.color || SLOTS[0], "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round"}, s);
@@ -261,7 +262,7 @@ function line(parent, pts, o) {
   hit.addEventListener("pointermove", e => { const i = at(e), p = pts[i];
     cross.setAttribute("x1", X(p[0])); cross.setAttribute("x2", X(p[0])); cross.setAttribute("visibility", "visible");
     dot.setAttribute("cx", X(p[0])); dot.setAttribute("cy", Y(p[1])); dot.setAttribute("visibility", "visible");
-    showTip(e, f(p[1]), "t = " + F.us(p[0] - x0), p.length > 2 ? [["max in bucket", f(p[2])]] : []); });
+    showTip(e, f(p[1]), "t = " + xf(p[0] - x0), p.length > 2 ? [["max in bucket", f(p[2])]] : []); });
   hit.addEventListener("pointerleave", () => { hideTip(); cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); });
   return box;
 }
@@ -271,7 +272,7 @@ function lanes(parent, tl, o) {
   o = o || {}; const W = chartW(parent), labW = Math.min(o.labelWidth || 220, Math.round(W * 0.35)), rowH = 18, gap = 4;
   const n = tl.lanes.length, bins = n ? tl.lanes[0].busy.length : 0, H = 6 + n * (rowH + gap) + 22, plotW = W - labW - 16;
   const box = el("div", {class: "chart"}, parent), s = sv("svg", {width: W, height: H, role: "img", "aria-label": o.title || "occupancy"}, box);
-  const bw = plotW / Math.max(1, bins), span = tl.t1 - tl.t0, unitFmt = tl.unit === "µs" ? F.us : (v => F.num(v) + " cycles");
+  const bw = plotW / Math.max(1, bins), span = tl.t1 - tl.t0, unitFmt = tl.unit === "µs" ? F.us : (v => F.num(v) + " " + tl.unit);
   tl.lanes.forEach((ln, i) => {
     const y = 6 + i * (rowH + gap);
     sv("text", {x: labW - 8, y: y + rowH / 2 + 4, "text-anchor": "end"}, s).textContent = truncate(ln.lane, Math.floor(labW / 7));
@@ -309,7 +310,7 @@ function render(root, page) {
       else if (b.type === "stacked") stacked(c, b.rows, b.series, b);
       else if (b.type === "line") { if (b.subtitle) txt("p", b.subtitle, c, "note"); line(c, b.points, b); }
       else if (b.type === "lanes") lanes(c, b.timeline, b);
-      else if (b.type === "note") txt("p", b.text, c, "note");
+      else if (b.type === "note" && b.text) txt("p", b.text, c, "note");
       if (b.table) tableView(c, b.table.cols, b.table.rows, b.table.open);
     }
   }
