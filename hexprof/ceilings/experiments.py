@@ -45,6 +45,38 @@ def _series(records: list[dict[str, Any]], x_key: str) -> dict[str, dict[str, An
     return out
 
 
+def _qhas(rec: dict[str, Any]) -> dict[str, Any]:
+    """QHAS headline numbers of a point's profile job, when its artifacts were downloaded (--hw)."""
+    files = [f for f in ((rec.get("hw_artifacts") or {}).get("qhas") or []) if str(f).endswith(".json")]
+    if not files or not Path(files[0]).exists():
+        return {}
+    try:
+        from hexprof.hwreport import qhas as QH
+
+        return QH.overall_kpis(QH.load_overall(files[0]))
+    except Exception:  # noqa: BLE001 - optional cross-check
+        return {}
+
+
+def _points_md(records: list[dict[str, Any]], x_key: str, x_label: str, qhas_bytes: bool = False) -> str:
+    """Per point: x, AI Hub latency and its run-to-run spread (min / median / max over the profile's runs)."""
+    head = ["point", x_label, "latency ms", "min", "median", "max", "runs"]
+    if qhas_bytes:
+        head += ["QHAS DRAM bytes", "QHAS ÷ assumed"]
+    rows = []
+    for r in records:
+        if r.get("latency_ms") is None:
+            continue
+        sp = (r.get("metrics") or {}).get("all_inference_times_milliseconds") or {}
+        x = r["graph"].get(x_key)
+        row = [r["key"], x, r["latency_ms"], sp.get("min"), sp.get("median"), sp.get("max"), sp.get("n")]
+        if qhas_bytes:
+            q = _qhas(r).get("total_dram")
+            row += [q, (q / x) if q and x else None]
+        rows.append(row)
+    return markdown_table(head, rows, 4)
+
+
 # --------------------------------------------------------------------------- compute
 
 
@@ -74,6 +106,7 @@ def compute_sweep(sweep: Sweep, precisions: Sequence[str], size: int, chain: Seq
     write_json(sweep.out / "compute_ceiling.json", result)
     md = "## Compute ceiling (latency = t0 + ops / P)\n\n" + markdown_table(
         ["precision", "P (TOPS)", "t0 (ms)", "R²", "points", "best attained TOPS"], rows_md, 3)
+    md += "\n\n### Points (AI Hub latency and its spread over the profile's runs)\n\n" + _points_md(records, "ops", "ops")
     (sweep.out / "compute_ceiling.md").write_text(md + "\n", encoding="utf-8")
     plot_fits(series, "compute", sweep.out / "compute_ceiling.png")
     print(md)
@@ -130,10 +163,23 @@ def bandwidth_sweep(
             s["fit"], s["headline"] = b["fit"], f"B={b['B_gbps']:.1f} GB/s, t0={b['t0_ms']:.2f} ms"
             rows_md.append([label, b["B_gbps"], b["t0_ms"], b["fit"]["r2"], len(s["x"]), max(b["attained_gbps"])])
         result["series"][label] = entry
+    # cross-check: refit on the DRAM bytes QHAS measured on the device instead of the assumed weight bytes
+    measured = [(r["key"], _qhas(r).get("total_dram"), r["latency_ms"]) for r in records
+                if r.get("latency_ms") is not None and r.get("series", "").startswith("width")]
+    measured = [m for m in measured if m[1]]
+    if len({m[1] for m in measured}) >= 2:
+        b = fit.bandwidth_ceiling([m[1] for m in measured], [m[2] for m in measured])
+        result["series"]["width sweep, QHAS-measured bytes"] = {
+            "points": [{"key": k, "bytes": x, "latency_ms": y} for k, x, y in measured], **b}
+        rows_md.append(["width sweep, QHAS-measured bytes", b["B_gbps"], b["t0_ms"], b["fit"]["r2"], len(measured),
+                        max(b["attained_gbps"])])
     write_json(sweep.out / "bandwidth_ceiling.json", result)
     md = f"## Bandwidth ceiling at {prec.name} (latency = t0 + bytes / B)\n\n" + markdown_table(
         ["sweep", "B (GB/s)", "t0 (ms)", "R²", "points", "best attained GB/s"], rows_md, 3)
-    md += "\n\nThe width sweep is the primary estimate; the depth sweep adds per-layer overhead and underestimates B."
+    md += ("\n\nThe width sweep is the primary estimate; the depth sweep adds per-layer overhead and underestimates B. "
+           "With --hw, the width sweep is refit on the DRAM bytes QHAS measured on the device; the two B values "
+           "should agree.")
+    md += "\n\n### Points\n\n" + _points_md(records, x_key, "assumed bytes", qhas_bytes=True)
     (sweep.out / "bandwidth_ceiling.md").write_text(md + "\n", encoding="utf-8")
     plot_fits(series, "bandwidth", sweep.out / "bandwidth_ceiling.png")
     print(md)

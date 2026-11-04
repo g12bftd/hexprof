@@ -207,16 +207,17 @@ class Sweep:
     def _collect(self, specs: Sequence[PointSpec]) -> None:
         for s in self._ok(specs):
             st = self.state[s.key]
-            if st.get("metrics"):
-                continue
-            job = hc.get_job(st["profile_job"])
-            prof, _ = hc.save_profile(job, self.out / "profiles", s.key)
-            st["metrics"] = aihub_metrics(prof)
-            st["qairt"] = hc.qairt_version(job)
-            st["latency_ms"] = st["metrics"]["inference_time_milliseconds"]
-            st["job_url"] = job.url
-            write_json(self.out / "profiles" / f"{s.key}.per_layer.json", per_layer(prof))
-            if self.hw:
+            job = None
+            if not st.get("metrics"):
+                job = hc.get_job(st["profile_job"])
+                prof, _ = hc.save_profile(job, self.out / "profiles", s.key)
+                st["metrics"] = aihub_metrics(prof)
+                st["qairt"] = hc.qairt_version(job)
+                st["latency_ms"] = st["metrics"]["inference_time_milliseconds"]
+                st["job_url"] = job.url
+                write_json(self.out / "profiles" / f"{s.key}.per_layer.json", per_layer(prof))
+            if self.hw and not (st.get("hw_artifacts") or {}).get("qhas"):  # also for points profiled earlier
+                job = job or hc.get_job(st["profile_job"])
                 st["hw_artifacts"] = hc.download_hw_artifacts(job, self.out / "hw" / s.key)
             self._save()
 

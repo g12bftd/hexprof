@@ -203,6 +203,31 @@ def test_compute_and_bandwidth_sweeps_recover_simulated_ceilings(tmp_path, monke
                                      width_layers=4, onchip_mb=0.001)
     s = bw["series"]["width sweep (4 layers)"]
     assert s["B_gbps"] == pytest.approx(55, rel=1e-3) and s["t0_ms"] == pytest.approx(0.2, abs=1e-6)
+    assert "width sweep, QHAS-measured bytes" not in bw["series"]  # no --hw: no cross-check
+
+    # --hw on a finished sweep downloads QHAS for the existing points and refits B on the measured bytes
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import hwfakes
+    import hexprof.aihub.client as hc
+
+    def arts(job, out):
+        st = next(v for v in json.loads((tmp_path / "bw" / "state.json").read_text()).values()
+                  if v.get("profile_job") == job.job_id)
+        doc = hwfakes.qhas_doc(20)
+        doc["data"]["htp_overall_summary"]["data"][0]["total_dram"] = st["graph"]["weight_bytes"] * 1.03
+        return {"qhas": [str(hwfakes.write_json(Path(out) / "qhas" / "q_main_qhas_summary.json", doc))], "optrace": []}
+
+    monkeypatch.setattr(hc, "download_hw_artifacts", arts)
+    n_before = len(hub.calls)
+    bw = experiments.bandwidth_sweep(Sweep(tmp_path / "bw", "Samsung Galaxy S25", hw=True), "w4a16",
+                                     widths=[128, 192, 256], width_layers=4, onchip_mb=0.001)
+    assert len(hub.calls) == n_before  # nothing resubmitted
+    m = bw["series"]["width sweep, QHAS-measured bytes"]
+    assert m["B_gbps"] == pytest.approx(55 * 1.03, rel=1e-3)  # 3% more bytes measured -> 3% higher B
+    md = (tmp_path / "bw" / "bandwidth_ceiling.md").read_text()
+    assert "QHAS ÷ assumed" in md and "1.03" in md
 
 
 def test_sweep_marks_failed_points_and_continues(tmp_path, monkeypatch):
