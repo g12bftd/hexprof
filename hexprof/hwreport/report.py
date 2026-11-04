@@ -40,11 +40,19 @@ QHAS_DEFS = {
                 "run time. This is the wall-time view: a unit with a large share here is what to speed up.",
     "qnn_dp": "Share of the critical path per QNN op type (Qualcomm's num_dominant_path_cycles): the op types that set the "
               "run time. Compare with the work view above: an op type can do a lot of work in parallel without being on it.",
-    "qnn": "QNN ops are the graph operations you exported; each lowers to one or more HTP ops. Cycles = total clock cycles "
-           "spent in that op type; % active cycles = cycles actively executing out of its total (Qualcomm).",
-    "mem": "Bytes moved between the HTP and DRAM (main memory) per QNN op type. VTCM is the HTP's on-chip memory.",
-    "htp": "HTP ops are what actually runs on the NPU. Reference op = “implementation runs purely on scalar code”; "
-           "format change = the op converts a tensor layout (Qualcomm). Both are overhead to look for.",
+    "qnn": "QNN ops are the operations of the QNN IR graph: what the converter made from your ONNX (one per ONNX node, "
+           "with its name). The HTP backend lowers each into one or more HTP ops (Qualcomm: “Number HTP Ops that roll up "
+           "into this QNN op type”). Cycles = “total number of clock cycles taken by the specified operation”; % active "
+           "cycles = “cycles when the operation is actively executing out of the total cycles” (Qualcomm).",
+    "mem": "Qualcomm: DRAM read / write = “Number of bytes of DRAM (Dynamic Random-Access Memory) Read / Write”: traffic to "
+           "main memory. VTCM read / write = “Number of bytes of VTCM (Vector Tightly Coupled Memory) Read / Write”: the "
+           "HTP's on-chip scratch memory, much faster than DRAM. Bytes, not cycles. A QNN row adds up the HTP ops that roll "
+           "up into it. GB/s = bytes ÷ the op's own time (cycles × µs per cycle, derived here); ops overlap, so per-op "
+           "rates do not add up to the graph's.",
+    "htp": "HTP ops are the kernels the HTP backend actually runs on the NPU after lowering the QNN graph: tiled over "
+           "threads and VTCM, with inserted data transfers and layout changes; each knows “the QNN IR Op this HTP op maps "
+           "to”. Reference op = “implementation runs purely on scalar code”; format change = the op converts a tensor "
+           "layout (Qualcomm). Both are overhead to look for.",
     "dominant": "Dominant (critical) path: Qualcomm “number of cycles on the critical path for the operation”. Ops with a high "
                 "share are the ones that set the run time; speeding up anything else does not shorten it.",
     "timeline": "Busy share of each HTP thread over the run, from the start cycle and length of every op instance. "
@@ -162,6 +170,39 @@ def _kind_color(kind: str) -> str:
     return f"var(--s{KINDS.index(k) + 1})" if k in KINDS[:-1] else "var(--other)"
 
 
+def _with_rates(rows: list[dict[str, Any]], us_per_cycle: float | None) -> list[dict[str, Any]]:
+    """Add DRAM / VTCM bytes and GB/s (bytes ÷ the op's own time) to QHAS op rows, in place."""
+    for r in rows:
+        r["dram_bytes"] = _n(r.get("dram_read")) + _n(r.get("dram_write"))
+        r["vtcm_bytes"] = _n(r.get("vtcm_read")) + _n(r.get("vtcm_write"))
+        t = _n(r.get("cycles")) * us_per_cycle * 1e-6 if us_per_cycle else 0.0
+        r["dram_gbps"] = r["dram_bytes"] / t / 1e9 if t else None
+        r["vtcm_gbps"] = r["vtcm_bytes"] / t / 1e9 if t else None
+    return rows
+
+
+MEM_COLS = [{"key": "dram_read", "label": "DRAM read", "kind": "bytes"},
+            {"key": "dram_write", "label": "DRAM write", "kind": "bytes"},
+            {"key": "vtcm_read", "label": "VTCM read", "kind": "bytes"},
+            {"key": "vtcm_write", "label": "VTCM write", "kind": "bytes"},
+            {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"},
+            {"key": "vtcm_gbps", "label": "VTCM GB/s", "kind": "num"}]
+
+
+def _mem_charts(rows: list[dict[str, Any]], label_fn: Any, top: int, what: str) -> list[dict[str, Any]]:
+    """DRAM and VTCM read/write as two stacked charts (different scales, so not one axis)."""
+    out = []
+    for mem, title in (("dram", "DRAM (main memory)"), ("vtcm", "VTCM (on-chip)")):
+        best = sorted(rows, key=lambda r: -(_n(r.get(f"{mem}_read")) + _n(r.get(f"{mem}_write"))))[:top]
+        if not any(_n(r.get(f"{mem}_read")) + _n(r.get(f"{mem}_write")) for r in best):
+            continue
+        out.append({"type": "note", "text": f"{title}: the {len(best)} {what} with the most traffic"})
+        out.append({"type": "stacked", "kind": "bytes", "series": [f"{mem.upper()} read", f"{mem.upper()} write"],
+                    "title": f"{title} traffic by {what}",
+                    "rows": [{"label": label_fn(r), "values": [_n(r.get(f"{mem}_read")), _n(r.get(f"{mem}_write"))]} for r in best]})
+    return out
+
+
 def _ms(v: Any) -> str:
     return "–" if v is None else f"{float(v):.3f} ms"
 
@@ -201,10 +242,15 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int, ctx: EF.Ctx | None 
         rep = QH.load(g.qhas, top_n=max(200, top), timeline_bins=bins)
         warnings += rep.warnings
         k = QH.overall_kpis(rep)
+        upc = rep.cycles_to_us()
+        for rows_ in (rep.qnn_op_types, rep.qnn_op_instances, rep.htp_op_types):
+            _with_rates(rows_, upc)
         summary["qhas"] = {"version": rep.version, "kpis": k, "by_kind": rep.instances.get("by_kind"),
                            "op_instances": rep.instances.get("count"),
                            "qnn_op_types": [{"op": r.get("op"), "cycles": _n(r.get("cycles")),
-                                             "dp_cycles": _n(r.get("dominant_path_cycles"))} for r in rep.qnn_op_types]}
+                                             "dp_cycles": _n(r.get("dominant_path_cycles")),
+                                             "dram_bytes": r["dram_bytes"], "vtcm_bytes": r["vtcm_bytes"]}
+                                            for r in rep.qnn_op_types]}
         tiles += [
             {"label": "HTP utilization", "value": f"{k['percent_utilization']:.1f}%" if k.get("percent_utilization") is not None else "–",
              "sub": "share of the run the NPU was busy"},
@@ -326,21 +372,43 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int, ctx: EF.Ctx | None 
                                     {"key": "cycles", "label": "Cycles", "kind": "num"},
                                     {"key": "percent_active_cycles", "label": "% active", "kind": "pct"},
                                     {"key": "num_htp_ops", "label": "HTP ops", "kind": "num"},
-                                    {"key": "dram_read", "label": "DRAM read", "kind": "bytes"},
-                                    {"key": "dram_write", "label": "DRAM write", "kind": "bytes"},
+                                    *MEM_COLS,
                                     {"key": "dominant_path_percent", "label": "% critical path", "kind": "pct"}],
                            "rows": rep.qnn_op_instances[:200]}}]})
-            mem = sorted(rep.qnn_op_types, key=lambda r: -(_n(r.get("dram_read")) + _n(r.get("dram_write"))))[:top]
-            if any(_n(r.get("dram_read")) + _n(r.get("dram_write")) for r in mem):
-                sections.append({"title": "Memory traffic by QNN op type", "why": QHAS_DEFS["mem"], "blocks": [
-                    {"type": "stacked", "kind": "bytes", "series": ["DRAM read", "DRAM write"], "title": "DRAM traffic",
-                     "rows": [{"label": str(r.get("op")), "values": [_n(r.get("dram_read")), _n(r.get("dram_write"))]} for r in mem],
-                     "table": {"cols": [{"key": "op", "label": "QNN op type", "kind": "str"},
-                                        {"key": "dram_read", "label": "DRAM read", "kind": "bytes"},
-                                        {"key": "dram_write", "label": "DRAM write", "kind": "bytes"},
-                                        {"key": "vtcm_read", "label": "VTCM read", "kind": "bytes"},
-                                        {"key": "vtcm_write", "label": "VTCM write", "kind": "bytes"}],
-                               "rows": mem}}]})
+            totals = inst.get("mem_totals") or {}
+            check = []
+            for key, lbl in (("dram_read", "DRAM read"), ("dram_write", "DRAM write"), ("vtcm_read", "VTCM read"),
+                             ("vtcm_write", "VTCM write")):
+                overall = k.get(f"total_{key}")
+                row = {"what": lbl, "overall": overall,
+                       "qnn_types": sum(_n(r.get(key)) for r in rep.qnn_op_types),
+                       "htp_types": sum(_n(r.get(key)) for r in rep.htp_op_types),
+                       "htp_instances": totals.get(key)}
+                row["qnn_vs_overall"] = 100 * row["qnn_types"] / overall if overall else None
+                check.append(row)
+            _csv(csv_dir / "memory_totals_check.csv", check)
+            qnn_by_dram = sorted(rep.qnn_op_instances, key=lambda r: -r["dram_bytes"])
+            sections.append({"title": "Memory traffic: QNN ops (DRAM and VTCM)", "why": QHAS_DEFS["mem"], "blocks": [
+                {"type": "note", "text": "Check: per-op bytes add up to QHAS's overall totals (they should agree; this "
+                                         "also confirms the columns are bytes).",
+                 "table": {"open": True, "cols": [
+                     {"key": "what", "label": "", "kind": "str"},
+                     {"key": "overall", "label": "Overall (QHAS summary)", "kind": "bytes"},
+                     {"key": "qnn_types", "label": "Σ QNN op types", "kind": "bytes"},
+                     {"key": "htp_types", "label": "Σ HTP op types", "kind": "bytes"},
+                     {"key": "htp_instances", "label": "Σ HTP op instances", "kind": "bytes"},
+                     {"key": "qnn_vs_overall", "label": "QNN ÷ overall", "kind": "pct"}], "rows": check}},
+                *_mem_charts(rep.qnn_op_types, lambda r: str(r.get("op")), top, "QNN op types"),
+                {"type": "note", "text": "All QNN op types:", "table": {"cols": [
+                    {"key": "op", "label": "QNN op type", "kind": "str"}, {"key": "num_htp_ops", "label": "HTP ops", "kind": "num"},
+                    {"key": "cycles", "label": "Cycles", "kind": "num"}, *MEM_COLS], "rows": rep.qnn_op_types}},
+                *_mem_charts(rep.qnn_op_instances, lambda r: str(r.get("qnn_op") or r.get("op")), top, "QNN ops (nodes)"),
+                {"type": "note", "text": f"QNN ops (nodes) with the most DRAM traffic (top {min(500, len(qnn_by_dram))}; "
+                                         "all nodes in qnn_op_instances.csv):",
+                 "table": {"cols": [{"key": "qnn_op", "label": "QNN op", "kind": "str"},
+                                    {"key": "op", "label": "Type", "kind": "str"},
+                                    {"key": "cycles", "label": "Cycles", "kind": "num"}, *MEM_COLS],
+                           "rows": qnn_by_dram[:500]}}]})
         if rep.htp_op_types:
             htot = sum(_n(r.get("cycles")) for r in rep.htp_op_types)
             _csv(csv_dir / "htp_op_types.csv", rep.htp_op_types)
@@ -362,10 +430,18 @@ def graph_page(g: Graph, out_dir: Path, top: int, bins: int, ctx: EF.Ctx | None 
                                     {"key": "percent_active_cycles", "label": "% active", "kind": "pct"},
                                     {"key": "reference_op", "label": "Ref op", "kind": "str"},
                                     {"key": "format_change", "label": "Format change", "kind": "str"},
-                                    {"key": "dram_read", "label": "DRAM read", "kind": "bytes"},
-                                    {"key": "dram_write", "label": "DRAM write", "kind": "bytes"},
+                                    *MEM_COLS,
                                     {"key": "dominant_path_percent", "label": "% critical path", "kind": "pct"}],
                            "rows": rep.htp_op_types}}]})
+            top_dram = inst.get("top_by_dram") or []
+            if top_dram:
+                _csv(csv_dir / "htp_op_instances_most_dram.csv", top_dram)
+            sections.append({"title": "Memory traffic: HTP ops (DRAM and VTCM)", "why": QHAS_DEFS["mem"], "blocks": [
+                *_mem_charts(rep.htp_op_types, hlabel, top, "HTP op types"),
+                *_mem_charts(top_dram, lambda r: f"{r.get('htp_op')} ({r.get('qnn_op')})", top, "HTP op instances"),
+                {"type": "note", "text": f"HTP op instances with the most DRAM traffic (top {len(top_dram)}):",
+                 "table": {"cols": _instance_cols(), "rows": top_dram}} if top_dram else
+                {"type": "note", "text": "No HTP op instance moved DRAM data."}]})
         dp = inst.get("top_by_dominant_path") or []
         if dp:
             sections.append({"title": "Critical path: ops that set the run time", "why": QHAS_DEFS["dominant"], "blocks": [
@@ -558,7 +634,9 @@ def _instance_cols() -> list[dict[str, str]]:
             {"key": "cycles", "label": "Cycles", "kind": "num"}, {"key": "time_us", "label": "Time", "kind": "us"},
             {"key": "percent_dominant_path_cycles", "label": "% critical path", "kind": "pct"},
             {"key": "dram_read", "label": "DRAM read", "kind": "bytes"}, {"key": "dram_write", "label": "DRAM write", "kind": "bytes"},
-            {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"}, {"key": "dims", "label": "Dims", "kind": "str"},
+            {"key": "vtcm_read", "label": "VTCM read", "kind": "bytes"}, {"key": "vtcm_write", "label": "VTCM write", "kind": "bytes"},
+            {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"}, {"key": "vtcm_gbps", "label": "VTCM GB/s", "kind": "num"},
+            {"key": "dims", "label": "Dims", "kind": "str"},
             {"key": "dtype", "label": "Dtype", "kind": "str"}]
 
 
@@ -623,7 +701,7 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) ->
         rows.append({"label": short_label(g.label), "folder": g.label, "href": f"{g.label}.html",
                      "time_ms": k["time_us"] / 1e3 if k.get("time_us") else None,
                      "util": k.get("percent_utilization"), "ips": k.get("inf_per_s"), "dram": k.get("total_dram"),
-                     "dram_gbps": k.get("dram_gbps"), "vtcm": k.get("total_vtcm"),
+                     "dram_gbps": k.get("dram_gbps"), "vtcm": k.get("total_vtcm"), "vtcm_gbps": k.get("vtcm_gbps"),
                      "aihub_ms": ah.get("inference_time_ms"), "peak_mb": pk.get("max"),
                      "load_peak_mb": (ah.get("first_load_peak_memory_range_mb") or {}).get("max"),
                      "published_ms": (g.published or {}).get("inference_time_milliseconds"),
@@ -669,6 +747,7 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) ->
              {"key": "dram", "label": "DRAM", "kind": "bytes"},
              {"key": "dram_gbps", "label": "DRAM GB/s", "kind": "num"},
              {"key": "vtcm", "label": "VTCM", "kind": "bytes"},
+             {"key": "vtcm_gbps", "label": "VTCM GB/s", "kind": "num"},
              {"key": "peak_mb", "label": "Inference peak MB", "kind": "num"},
              {"key": "load_peak_mb", "label": "Load peak MB", "kind": "num"},
              {"key": "trace_ms", "label": "Trace ms", "kind": "num"},
@@ -718,6 +797,26 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None) ->
                    for lbl, sh in shares.items()]
         sections.append({"title": "What sets the run time: critical path by QNN op type, per graph", "why": QHAS_DEFS["qnn_dp"],
                          "blocks": [_stack_block(op_rows, series, "critical path by QNN op type")]})
+    for mem, name in (("dram_bytes", "DRAM"), ("vtcm_bytes", "VTCM")):
+        shares_m: dict[str, dict[str, float]] = {}
+        for g in graphs:
+            ts = g.out.get("qhas", {}).get("qnn_op_types") or []
+            tot = sum(t.get(mem, 0.0) for t in ts)
+            if tot:
+                shares_m[g.label] = {str(t["op"]): 100 * t.get(mem, 0.0) / tot for t in ts}
+        if not shares_m:
+            continue
+        best_m: dict[str, float] = {}
+        for sh in shares_m.values():
+            for op, v in sh.items():
+                best_m[op] = max(best_m.get(op, 0.0), v)
+        keep_m = [op for op, _ in sorted(best_m.items(), key=lambda kv: -kv[1])[:7]]
+        sections.append({"title": f"Where the {name} traffic goes: by QNN op type, per graph",
+                         "why": QHAS_DEFS["mem"].split(" A QNN row")[0],
+                         "blocks": [_stack_block([{"label": short_label(lbl), "values": [sh.get(op, 0.0) for op in keep_m]
+                                                   + [sum(v for op, v in sh.items() if op not in keep_m)]}
+                                                  for lbl, sh in shares_m.items()], keep_m + ["Other"],
+                                                 f"{name} bytes by QNN op type")]})
     return {"title": title, "subtitle": f"{len(graphs)} graph(s): QHAS summaries, optrace timelines and AI Hub profiles.",
             "tiles": tiles, "sections": sections,
             "footer": "Generated by hexprof hw report. Definitions quoted from Qualcomm's QAIRT Visualizer."}

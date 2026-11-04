@@ -304,6 +304,7 @@ export, `<component>/` for a SigLIP 2 run), attaches AI Hub's `<graph>.profile.j
   * AI Hub time, peak memory and published time; QHAS time, HTP utilization, inferences per second,
     DRAM/VTCM bytes and average GB/s.
   * **What sets the run time**: critical-path share by unit (HMX / HVX / DMA / sync / …) and by QNN op type.
+  * **Where the DRAM / VTCM traffic goes**: bytes by QNN op type, per graph.
   * **Where the work goes**: op cycles summed over all HTP threads, by unit.
 * `<graph>.html`, one page per graph:
   * **Overall summary per HTP core**: Qualcomm's "% of overall timeline HTP utilization", inferences per
@@ -314,7 +315,10 @@ export, `<component>/` for a SigLIP 2 run), attaches AI Hub's `<graph>.profile.j
   * **By unit**: critical-path share (what sets the run time) and op-cycle share (where the work goes).
   * **QNN op types and nodes**: cycles, % active cycles, HTP ops, DRAM/VTCM traffic, % on the critical path.
   * **HTP op types**: reference ops (scalar code) and format changes flagged.
-  * **Critical (dominant) path ops** and the **slowest HTP op instances**, with time and DRAM GB/s.
+  * **Memory traffic, QNN ops and HTP ops**: DRAM read / write and VTCM read / write per op type, per QNN
+    node and per HTP op instance (bytes, as in Workbench's runtime analysis), each op's DRAM and VTCM GB/s,
+    the ops with the most traffic, and a check that the per-op bytes add up to QHAS's totals.
+  * **Critical (dominant) path ops** and the **slowest HTP op instances**, with time, DRAM / VTCM bytes and GB/s.
   * **QHAS timeline**: occupancy of each HTP thread.
   * **Optrace**: busy share and timeline per thread, counter tracks such as memory bandwidth over time,
     and time by op name.

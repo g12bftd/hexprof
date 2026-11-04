@@ -211,6 +211,8 @@ def _aggregate_instances(path: str, top_n: int, bins: int, rep: QhasReport, prog
     starts, cycles_arr, lane_idx = array("d"), array("d"), array("i")
     top_cycles: list[tuple[float, int, dict[str, Any]]] = []
     top_dp: list[tuple[float, int, dict[str, Any]]] = []
+    top_dram: list[tuple[float, int, dict[str, Any]]] = []
+    mem = dict.fromkeys(("dram_read", "dram_write", "vtcm_read", "vtcm_write"), 0.0)
     t_start = time.time()
     for r in jsonstream.items(path, "data.htp_op_instances.data.item"):
         count += 1
@@ -222,7 +224,10 @@ def _aggregate_instances(path: str, top_n: int, bins: int, rep: QhasReport, prog
         k = by_kind[kind]
         k["count"] += 1
         k["cycles"] += c
-        k["dram_bytes"] += (num(r.get("dram_read")) or 0.0) + (num(r.get("dram_write")) or 0.0)
+        for key in mem:
+            mem[key] += num(r.get(key)) or 0.0
+        dram_b = (num(r.get("dram_read")) or 0.0) + (num(r.get("dram_write")) or 0.0)
+        k["dram_bytes"] += dram_b
         dpc = num(r.get("num_dominant_path_cycles")) or 0.0
         k["dp_cycles"] += dpc
         t = by_type[typ]
@@ -244,17 +249,23 @@ def _aggregate_instances(path: str, top_n: int, bins: int, rep: QhasReport, prog
         if dpv > 0 and (len(top_dp) < top_n or dpv > top_dp[0][0]):
             slim = slim or _slim(r, c, s, kind, typ)
             (heapq.heappush if len(top_dp) < top_n else heapq.heapreplace)(top_dp, (dpv, count, slim))
+        if dram_b > 0 and (len(top_dram) < top_n or dram_b > top_dram[0][0]):
+            slim = slim or _slim(r, c, s, kind, typ)
+            (heapq.heappush if len(top_dram) < top_n else heapq.heapreplace)(top_dram, (dram_b, count, slim))
 
     timeline = _lane_occupancy(np.frombuffer(starts, dtype=np.float64), np.frombuffer(cycles_arr, dtype=np.float64),
                                np.frombuffer(lane_idx, dtype=np.int32), lanes, bins)
     us_per_cycle = rep.cycles_to_us()
     top = [x[2] for x in sorted(top_cycles, key=lambda t: -t[0])]
     dp_rows = [x[2] for x in sorted(top_dp, key=lambda t: -t[0])]
-    if us_per_cycle:
-        for x in {id(x): x for x in top + dp_rows}.values():
+    dram_rows = [x[2] for x in sorted(top_dram, key=lambda t: -t[0])]
+    for x in {id(x): x for x in top + dp_rows + dram_rows}.values():
+        x["dram_bytes"] = (x["dram_read"] or 0.0) + (x["dram_write"] or 0.0)
+        x["vtcm_bytes"] = (x["vtcm_read"] or 0.0) + (x["vtcm_write"] or 0.0)
+        if us_per_cycle:
             x["time_us"] = x["cycles"] * us_per_cycle
-            b = (x["dram_read"] or 0.0) + (x["dram_write"] or 0.0)
-            x["dram_gbps"] = b / (x["time_us"] * 1e-6) / 1e9 if x["time_us"] else None
+            x["dram_gbps"] = x["dram_bytes"] / (x["time_us"] * 1e-6) / 1e9 if x["time_us"] else None
+            x["vtcm_gbps"] = x["vtcm_bytes"] / (x["time_us"] * 1e-6) / 1e9 if x["time_us"] else None
     return {
         "count": count,
         "total_cycles": total_cycles,
@@ -262,6 +273,8 @@ def _aggregate_instances(path: str, top_n: int, bins: int, rep: QhasReport, prog
         "by_type": dict(by_type),
         "top_by_cycles": top,
         "top_by_dominant_path": dp_rows,
+        "top_by_dram": dram_rows,
+        "mem_totals": mem,
         "timeline": timeline,
         "us_per_cycle": us_per_cycle,
     }

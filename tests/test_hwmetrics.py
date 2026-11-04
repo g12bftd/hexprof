@@ -209,3 +209,44 @@ def test_efficiency_uses_qhas_measured_bytes(tmp_path):
     assert row["bytes_source"] == "QHAS"
     assert row["bytes"] == pytest.approx(q["data"]["htp_overall_summary"]["data"][0]["total_dram"])
     assert row["bytes_estimate"] == pytest.approx(8 * 32 / 2 + 32 * 4)  # 4-bit lm_head + fp32 scale per channel
+
+
+def test_memory_traffic_sections_and_totals_check(tmp_path):
+    import re
+
+    root = hwfakes.gemma_export_layout(tmp_path / "e", parts=1, instances=200)
+    label = "part_1_of_1__token_ar1_cl4096_1_of_1"
+    doc = json.loads(next((root / "hw" / label / "qhas").glob("*.json")).read_text())
+    index = report.build([root], tmp_path / "out", top=4, bins=10)
+    page = json.loads(re.search(r'id="data">(.*?)</script>', (index.parent / f"{label}.html").read_text(), re.S)
+                      .group(1).replace("<\\/", "</"))
+    secs = {s["title"]: s for s in page["sections"]}
+    q = secs["Memory traffic: QNN ops (DRAM and VTCM)"]
+    check = {r["what"]: r for r in q["blocks"][0]["table"]["rows"]}
+    insts = doc["data"]["htp_op_instances"]["data"]
+    ov = doc["data"]["htp_overall_summary"]["data"][0]
+    for key, what in (("dram_read", "DRAM read"), ("vtcm_write", "VTCM write")):
+        assert check[what]["overall"] == pytest.approx(ov[f"total_{key}"])
+        assert check[what]["htp_instances"] == pytest.approx(sum(r[key] for r in insts))
+        assert check[what]["qnn_types"] == pytest.approx(sum(r[key] for r in doc["data"]["qnn_op_types"]["data"]))
+        assert check[what]["qnn_vs_overall"] == pytest.approx(100)
+    charts = [b for b in q["blocks"] if b["type"] == "stacked"]
+    assert [c["series"] for c in charts][:2] == [["DRAM read", "DRAM write"], ["VTCM read", "VTCM write"]]
+    assert all(len(c["rows"]) <= 4 for c in charts)
+    types_table = next(b for b in q["blocks"] if b.get("text") == "All QNN op types:")["table"]
+    row = types_table["rows"][0]
+    t = row["cycles"] * ov["time_us"] / ov["timeline_cycles"] * 1e-6
+    assert row["vtcm_gbps"] == pytest.approx((row["vtcm_read"] + row["vtcm_write"]) / t / 1e9)
+    h = secs["Memory traffic: HTP ops (DRAM and VTCM)"]
+    inst_table = next(b for b in h["blocks"] if b.get("table"))["table"]
+    keys = [c["key"] for c in inst_table["cols"]]
+    assert {"vtcm_read", "vtcm_write", "vtcm_gbps", "dram_gbps"} <= set(keys)
+    dram_top = [r["dram_bytes"] for r in inst_table["rows"]]
+    assert dram_top == sorted(dram_top, reverse=True) and dram_top[0] == max(r["dram_read"] + r["dram_write"] for r in insts)
+    htp_types = next(b for b in secs["HTP op types"]["blocks"] if b.get("table"))["table"]
+    assert "vtcm_read" in [c["key"] for c in htp_types["cols"]]
+    overview = json.loads(re.search(r'id="data">(.*?)</script>', index.read_text(), re.S).group(1).replace("<\\/", "</"))
+    titles = [s["title"] for s in overview["sections"]]
+    assert "Where the DRAM traffic goes: by QNN op type, per graph" in titles
+    assert "Where the VTCM traffic goes: by QNN op type, per graph" in titles
+    assert (index.parent / label / "memory_totals_check.csv").exists()
