@@ -159,6 +159,8 @@ function chartW(parent) { const cs = getComputedStyle(parent);
   const w = parent.clientWidth - parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0);
   return Math.max(300, Math.floor(w || 900)); }
 function edgeAnchor(x, W) { return x > W - 40 ? "end" : x < 40 ? "start" : "middle"; }
+function topTicks(max, n) { const t = niceTicks(max, n);  // ticks whose last one is at or above max
+  if (t[t.length - 1] < max) t.push(t[t.length - 1] + (t.length > 1 ? t[1] - t[0] : max)); return t; }
 function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 function niceTicks(max, n) {
   if (!(max > 0)) return [0];
@@ -242,7 +244,7 @@ function line(parent, pts, o) {
   if (!pts.length) { txt("p", "No samples.", parent, "note"); return; }
   const xf = !o.xunit || o.xunit === "µs" ? F.us : (v => F.num(v) + " " + o.xunit);
   const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]), x0 = xs[0], x1 = xs[xs.length - 1] || x0 + 1;
-  const yMax = Math.max(1e-12, ...pts.map(p => p.length > 2 ? p[2] : p[1])), ticks = niceTicks(yMax, 4), yTop = ticks[ticks.length - 1];
+  const yMax = Math.max(1e-12, ...pts.map(p => p.length > 2 ? p[2] : p[1])), ticks = topTicks(yMax, 4), yTop = ticks[ticks.length - 1];
   const X = v => L + (W - L - R) * ((v - x0) / Math.max(1e-12, x1 - x0)), Y = v => T + (H - T - B) * (1 - v / yTop);
   const box = el("div", {class: "chart"}, parent), s = sv("svg", {width: W, height: H, role: "img", "aria-label": o.title || "line chart"}, box);
   for (const t of ticks) { sv("line", {x1: L, x2: W - R, y1: Y(t), y2: Y(t), class: "grid"}, s);
@@ -330,6 +332,34 @@ function roofline(parent, o) {
   return box;
 }
 
+// ---- metric vs swept value: one 2px line + markers per series, x ticks at the swept values ------------------
+function xy(parent, o) {
+  const series = (o.series || []).filter(s => s.points && s.points.length);
+  if (!series.length) { txt("p", "No verified points.", parent, "note"); return; }
+  const f = fmtBy(o.kind), W = chartW(parent), H = 240, L = 72, R = 24, T = 12, Bo = 40;
+  if (series.length > 1) { const lg = el("div", {class: "legend"}, parent);
+    series.forEach((s, i) => { const sp = el("span", {}, lg); const sw = el("i", {}, sp); sw.style.background = SLOTS[i % 8]; txt("span", s.name, sp); }); }
+  const xsAll = [...new Set(series.flatMap(s => s.points.map(p => p[0])))].sort((a, b) => a - b);
+  const ys = series.flatMap(s => s.points.map(p => p[1])), yMax = Math.max(1e-12, ...ys);
+  const logx = o.xlog && xsAll[0] > 0 && xsAll[xsAll.length - 1] / xsAll[0] >= 8;
+  const xv = v => logx ? Math.log2(v) : v, x0 = xv(xsAll[0]), x1 = xv(xsAll[xsAll.length - 1]);
+  const X = v => xsAll.length < 2 ? (L + W - R) / 2 : L + (W - L - R) * (xv(v) - x0) / (x1 - x0);
+  const ticks = topTicks(yMax, 4), yTop = ticks[ticks.length - 1], Y = v => T + (H - T - Bo) * (1 - v / yTop);
+  const box = el("div", {class: "chart"}, parent), s = sv("svg", {width: W, height: H, role: "img", "aria-label": o.title || "metric vs value"}, box);
+  for (const t of ticks) { sv("line", {x1: L, x2: W - R, y1: Y(t), y2: Y(t), class: "grid"}, s);
+    sv("text", {x: L - 6, y: Y(t) + 4, "text-anchor": "end", class: "axis"}, s).textContent = f(t); }
+  for (const v of xsAll) sv("text", {x: X(v), y: H - Bo + 16, "text-anchor": "middle", class: "axis"}, s).textContent = String(v);
+  if (o.xlabel) sv("text", {x: (L + W - R) / 2, y: H - 4, "text-anchor": "middle", class: "axis"}, s).textContent = o.xlabel + (logx ? " (log scale)" : "");
+  series.forEach((ser, i) => { const color = SLOTS[i % 8], pts = ser.points.slice().sort((a, b) => a[0] - b[0]);
+    let d = ""; pts.forEach((p, j) => { d += (j ? "L" : "M") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1); });
+    if (pts.length > 1) sv("path", {d: d, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round"}, s);
+    pts.forEach(p => { const g = sv("g", {class: "mark"}, s);
+      sv("circle", {cx: X(p[0]), cy: Y(p[1]), r: 4.5, fill: color, stroke: "var(--surface-1)", "stroke-width": 2}, g);
+      const hit = sv("circle", {cx: X(p[0]), cy: Y(p[1]), r: 11, class: "hit"}, g);
+      hover(hit, e => showTip(e, f(p[1]), (o.xlabel || "value") + " = " + p[0], [["series", ser.name, color]])); }); });
+  return box;
+}
+
 // ---- page assembly --------------------------------------------------------------------------------------------
 function card(root, title, why) { const c = el("section", {class: "card"}, root); txt("h2", title, c); if (why) txt("p", why, c, "why"); return c; }
 function tiles(root, items) { const t = el("div", {class: "tiles"}, root);
@@ -348,6 +378,7 @@ function render(root, page) {
       else if (b.type === "line") { if (b.subtitle) txt("p", b.subtitle, c, "note"); line(c, b.points, b); }
       else if (b.type === "lanes") lanes(c, b.timeline, b);
       else if (b.type === "roofline") roofline(c, b);
+      else if (b.type === "xy") xy(c, b);
       else if (b.type === "note" && b.text) txt("p", b.text, c, "note");
       if (b.table) tableView(c, b.table.cols, b.table.rows, b.table.open);
     }

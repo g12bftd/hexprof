@@ -83,10 +83,10 @@ def source_of(model: Any, graph: str | None, max_hops: int = 6) -> tuple[Any, An
                 return None, None
             continue
         src = getattr(job, "model", None)
+        if type(job).__name__ == "CompileJob" or hasattr(job, "get_target_model"):
+            return src, job  # the compile job (its input shapes) matters even if the source can't be read
         if src is None:
             return None, None
-        if type(job).__name__ == "CompileJob" or hasattr(job, "get_target_model"):
-            return src, job
         model = src  # e.g. a quantize job: keep walking
     return None, None
 

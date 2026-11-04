@@ -113,6 +113,29 @@ def run_official_export(checkpoint: str | Path, out_dir: str | Path, device_name
         return select_pipeline(source_dir)(**vars(args))
 
 
+def parse_export_args(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
+                      target_runtime: str = "geniex_qairt", precision: str = "w4a16",
+                      extra: Sequence[str] = ()) -> dict[str, Any]:
+    """Parse the export arguments with Qualcomm's own parser, without running anything.
+
+    Unknown flags or invalid values raise here (argparse exits), so a study fails before
+    submitting jobs; the returned values are exactly what the export will receive.
+    """
+    _require_qaihm()
+    from qai_hub_models.cli.dispatch import build_export_parser_for  # type: ignore[import-not-found]
+    from qai_hub_models.utils.export.context import resolve_recipe_dir  # type: ignore[import-not-found]
+
+    parser = build_export_parser_for(resolve_recipe_dir(MODEL_ID))
+    argv = export_argv(set(parser._option_string_actions), checkpoint, device_name, target_runtime, precision,
+                       Path(out_dir) / "export_assets", extra)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        raise ValueError(f"Qualcomm's export parser rejected: {' '.join(argv)}") from e
+    return {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in vars(args).items()
+            if isinstance(v, (str, int, float, bool, list, tuple, type(None)))}
+
+
 def export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
            target_runtime: str = "geniex_qairt", precision: str = "w4a16", extra: Sequence[str] = (),
            hw: bool = True) -> dict[str, Any]:

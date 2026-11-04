@@ -384,6 +384,72 @@ def cmd_hw_fetch_models(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- studies
+
+STUDY_FIXED = {  # fixed setting -> (targets it applies to, the axis it would conflict with)
+    "context_length": ({"gemma4-text"}, "context-length"), "prompt_length": ({"gemma4-text"}, "prompt-length"),
+    "components": ({"gemma4-text"}, None), "checkpoint": ({"gemma4-text"}, None),
+    "target_runtime": ({"gemma4-text"}, None), "precision": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, "precision"),
+    "qairt": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, "qairt"),
+    "batch": ({"siglip2-image", "siglip2-text"}, "batch"), "image_size": ({"gemma4-vision"}, "image-size"),
+    "calibration_samples": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, None),
+}
+
+
+def _study_fixed(args: argparse.Namespace) -> dict:
+    fixed = {}
+    for key, (targets, axis) in STUDY_FIXED.items():
+        val = getattr(args, key, None)
+        if val is None:
+            continue
+        if args.target not in targets:
+            raise SystemExit(f"--{key.replace('_', '-')} does not apply to {args.target}")
+        if axis == args.axis:
+            raise SystemExit(f"--{key.replace('_', '-')} is the swept axis; give its values with --values")
+        fixed[key] = val
+    return fixed
+
+
+def cmd_study_run(args: argparse.Namespace) -> int:
+    from hexprof.study import run as S
+
+    S.run(args.target, args.axis, args.values or [], _study_fixed(args), args.out, args.device, args.force,
+          compare=not args.no_compare, compute_json=args.compute_json, bandwidth_json=args.bandwidth_json)
+    return 0
+
+
+def cmd_study_verify(args: argparse.Namespace) -> int:
+    from hexprof.study import run as S
+
+    st = S.reverify(args.study_dir)
+    bad = [v for v, r in st["variants"].items() if r.get("status") == "profiled" and not r.get("verified")]
+    return 1 if bad else 0
+
+
+def cmd_study_compare(args: argparse.Namespace) -> int:
+    from hexprof.study import compare as C
+    from hexprof.study import run as S
+
+    dc, db = S.default_ceilings()
+    C.compare(args.study_dir, args.compute_json or dc, args.bandwidth_json or db, rebuild=args.rebuild)
+    return 0
+
+
+def cmd_study_list(args: argparse.Namespace) -> int:
+    from hexprof.study import run as S
+
+    print(S.describe())
+    return 0
+
+
+def cmd_hub_frameworks(args: argparse.Namespace) -> int:
+    from hexprof.aihub import client as hc
+
+    for fw in hc.hub().get_frameworks():
+        print(f"{fw.name:<8} {fw.api_version:<8} {fw.full_version:<24} {', '.join(fw.api_tags)}")
+    return 0
+
+
 # --------------------------------------------------------------------------- ceilings
 
 
@@ -604,6 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hw", action="store_true")
     p.add_argument("--out")
     p.set_defaults(func=cmd_hub_profile)
+    p = h.add_parser("frameworks", help="QAIRT versions available on AI Hub (values for --qairt)")
+    p.set_defaults(func=cmd_hub_frameworks)
     p = h.add_parser("metrics", help="AI Hub metrics of an existing profile job")
     p.add_argument("job_id")
     p.add_argument("--hw", action="store_true")
@@ -652,6 +720,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--field-map", nargs="*", help="override field mapping, e.g. hmx_util=hmx.utilization_pct")
     p.add_argument("--out")
     p.set_defaults(func=cmd_hw_classify)
+
+    # ---- studies
+    st = sub.add_parser("study", help="sweep a deployment setting on AI Hub's S25, verify each value ran, compare"
+                        ).add_subparsers(dest="sub", required=True)
+    p = st.add_parser("list", help="targets, axes and default sweep values")
+    p.set_defaults(func=cmd_study_list)
+    p = st.add_parser("run", help="build, compile and profile every value on the device, verify, compare")
+    p.add_argument("target", choices=["gemma4-text", "gemma4-vision", "siglip2-image", "siglip2-text"])
+    p.add_argument("--axis", required=True, help="setting to sweep (see `hexprof study list`)")
+    p.add_argument("--values", nargs="+", help="values to sweep (default: the list in `hexprof study list`)")
+    p.add_argument("--out", help="study folder (default: $HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>); "
+                                 "re-running resumes")
+    p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
+    p.add_argument("--force", action="store_true", help="rebuild values that were already profiled")
+    p.add_argument("--no-compare", action="store_true", help="skip the comparison page")
+    p.add_argument("--compute-json", help="ceilings for the reports (default: runs/ceil-compute/compute_ceiling.json)")
+    p.add_argument("--bandwidth-json", help="(default: runs/ceil-bandwidth/bandwidth_ceiling.json)")
+    g = p.add_argument_group("fixed settings, gemma4-text")
+    g.add_argument("--context-length", type=int, help="context length when not swept (Qualcomm: 4096)")
+    g.add_argument("--prompt-length", type=int, help="prompt chunk when not swept (Qualcomm: 128)")
+    g.add_argument("--components", nargs="+", help="export these parts (default: the 4 text parts)")
+    g.add_argument("--checkpoint", help="DEFAULT = Qualcomm's published w4a16 checkpoint")
+    g.add_argument("--target-runtime", help="Qualcomm export runtime (default geniex_qairt)")
+    g = p.add_argument_group("fixed settings, gemma4-vision / siglip2-*")
+    g.add_argument("--precision", help="float, w8a16, w8a8, w4a16 (default: Qualcomm's: float vision, w8a16 SigLIP 2)")
+    g.add_argument("--qairt", help="QAIRT version on AI Hub: default, latest or 2.xx (see `hexprof hub frameworks`)")
+    g.add_argument("--batch", type=int, help="SigLIP 2 batch size when not swept")
+    g.add_argument("--image-size", type=int, help="vision encoder input size when not swept (Qualcomm: 448)")
+    g.add_argument("--calibration-samples", type=int, help="quantize-job calibration samples (default: Qualcomm's)")
+    p.set_defaults(func=cmd_study_run)
+    p = st.add_parser("verify", help="re-check every profiled value of a study against AI Hub")
+    p.add_argument("study_dir")
+    p.set_defaults(func=cmd_study_verify)
+    p = st.add_parser("compare", help="(re)build the comparison page of a study")
+    p.add_argument("study_dir")
+    p.add_argument("--compute-json")
+    p.add_argument("--bandwidth-json")
+    p.add_argument("--rebuild", action="store_true", help="rebuild every variant's hardware report")
+    p.set_defaults(func=cmd_study_compare)
 
     # ---- ceilings
     c = sub.add_parser("ceilings", help="measure NPU compute / bandwidth ceilings on AI Hub").add_subparsers(dest="sub", required=True)

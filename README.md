@@ -426,6 +426,7 @@ collects the metrics plus optrace/QHAS for each, and builds the GenieX QAIRT bun
 | `slurm/gemma4_profile.sh` | `hexprof gemma4 aihub --export-only`: compile Gemma 4 and profile every part | `$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/` |
 | `slurm/siglip2_profile.sh` | `hexprof siglip2 profile`: image and text encoders | `$HEXPROF_DOWNLOAD_DIR/runs/siglip2-profile-<jobid>/` |
 | `slurm/ceilings.sh` | `hexprof ceilings compute` (w8a16, w4a16, fp16) and `ceilings bandwidth` (w4a16); resumable | `$HEXPROF_DOWNLOAD_DIR/runs/ceil-compute/`, `runs/ceil-bandwidth/` |
+| `slurm/study.sh` | `hexprof study run …` with the arguments you pass (one sweep, verified and compared) | `$HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>/comparison/` |
 | `slurm/hw_report.sh` | `hexprof hw fetch-models` + `hexprof hw report` on both profiling results, with the ceilings when present | `…/hw_report/index.html` in each |
 
 ```bash
@@ -453,6 +454,55 @@ with `HEXPROF_REPO`). `HEXPROF_DOWNLOAD_DIR` defaults to `/capstor/scratch/cscs/
 to `/capstor/scratch/cscs/$USER/job_logs/hexprof/`, which must exist before you submit. Override the
 project with `sbatch --account=<project> …`. To build the report automatically once both profiling
 jobs succeed, submit it with `--dependency=afterok:<gemma_jobid>:<siglip_jobid>`.
+
+## Systematic studies (sweeps verified on the device)
+
+`hexprof study` sweeps one deployment setting over a list of values. For every value it:
+1. builds the variant with Qualcomm's own code;
+2. compiles it and profiles it on AI Hub's S25;
+3. **verifies** it: hexprof reads back from AI Hub what actually ran (graph names, input shapes of the
+   compiled graphs, quantize-job dtypes, the model the compiler consumed, the graph selected for profiling,
+   QAIRT version, device) and checks it against the request;
+4. writes a hardware report per value and a comparison page.
+
+Unverified values are flagged with the failed checks and kept out of the charts.
+
+```bash
+hexprof study list
+```
+
+| Target | Axis | Default values | How it is built |
+|---|---|---|---|
+| `gemma4-text` | `context-length` | 512 1024 2048 4096 | `qai-hub-models export gemma_4_e4b_it --context-lengths V` (text parts only) |
+| `gemma4-text` | `prompt-length` | 64 128 256 512 | `--sequence-lengths V 1` |
+| `gemma4-text` | `decode-tokens` | 1 2 4 8 | `--sequence-lengths V`: cost of checking V drafted tokens at once (speculative decoding) |
+| `gemma4-vision` | `image-size` | 224 336 448 560 | Qualcomm's `VisionEncoder.from_pretrained(image_size=V)` |
+| `gemma4-vision` | `precision` | float w8a16 | AI Hub quantize job on Qualcomm's float graph (Qualcomm ships float only) |
+| `siglip2-image` / `siglip2-text` | `batch` | 1 2 4 8 (16) | Qualcomm's `get_input_spec(image_batch_size / text_batch_size=V)` |
+| `siglip2-image` / `siglip2-text` | `precision` | float w8a16 w8a8 w4a16 | Qualcomm's quantize stage (`run_quantize`) |
+| all single-graph targets | `qairt` | default latest | `--qairt_version V` on compile and profile (`hexprof hub frameworks` lists versions) |
+
+Qualcomm's shipped setting is always among the defaults, so every study has its reference point.
+
+```bash
+sbatch slurm/study.sh gemma4-text --axis context-length --values 512 1024 2048 4096
+```
+
+```bash
+hexprof study compare $HEXPROF_DOWNLOAD_DIR/studies/gemma4-text__context-length
+```
+
+Results go to `$HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>/`: one folder per value (jobs, profiles, QHAS
+/ optrace, `verification.json`, `hw_report/`) and `comparison/index.html` with every metric against the value,
+plus CSV / JSON. Settings that are not swept are flags too (`--context-length`, `--prompt-length`,
+`--precision`, `--qairt`, `--batch`, `--image-size`). They are recorded in `study.json`, and a study folder
+refuses to mix runs with different fixed settings. Re-running resumes; `hexprof study verify <dir>` re-checks
+against AI Hub.
+
+What the studies do not establish:
+* accuracy. Quantized variants are calibrated with Qualcomm's calibration data, or the model's sample inputs
+  when that is unavailable; quality must be evaluated separately;
+* whether GenieX on a phone accepts a changed graph. AI Hub runs each graph on the S25 on its own.
 
 ## Tests
 
