@@ -121,9 +121,10 @@ def optrace_doc(n: int = 400, seed: int = 0, bare_list: bool = False, span: floa
     return ev if bare_list else {"traceEvents": ev, "displayTimeUnit": "ns"}
 
 
-def profile_doc(seed: int = 0, n: int = 30, ms: float = 21.5) -> dict[str, Any]:
+def profile_doc(seed: int = 0, n: int = 30, ms: float = 21.5, cpu: bool = True) -> dict[str, Any]:
+    """AI Hub profile; ``cpu``: every 10th op on the CPU (as a mixed ONNX Runtime / TFLite placement would be)."""
     rnd = random.Random(seed)
-    detail = [{"name": f"/model/layers.{i // 3}/{op}", "type": op, "compute_unit": "NPU" if i % 10 else "CPU",
+    detail = [{"name": f"/model/layers.{i // 3}/{op}", "type": op, "compute_unit": "CPU" if cpu and not i % 10 else "NPU",
                "execution_time": round(rnd.expovariate(1 / 300), 1), "execution_cycles": int(rnd.random() * 1e6)}
               for i, op in enumerate(rnd.choice(["MatMul", "RmsNorm", "Softmax", "Add"]) for _ in range(n))]
     return {"execution_summary": {"estimated_inference_time": ms * 1000, "inference_memory_peak_range": [0, 180 * 2**20],

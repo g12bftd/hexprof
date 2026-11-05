@@ -421,6 +421,8 @@ def verify(out: Path, device: str) -> dict[str, Any]:
             continue
         pjob = hc.get_job(gs["profile_job"])
         core.device_check(checks, pjob, device, f"{label}: device")
+        stem = label.replace("/", "__")
+        core.npu_check(checks, out / "profiles" / f"{stem}.profile.json", out / "hw" / stem, label)
         opts = str(getattr(pjob, "options", "") or "")
         core.check(checks, f"{label}: graph selected for profiling", f"context_enable_graphs={g}", opts,
                    f"context_enable_graphs={g}" in opts)

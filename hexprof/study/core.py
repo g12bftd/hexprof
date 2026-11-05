@@ -294,5 +294,36 @@ def device_check(checks: list[dict[str, Any]], job: Any, device: str, what: str 
     check(checks, what, device, name, name == device)
 
 
+def npu_check(checks: list[dict[str, Any]], profile_path: Path | None, hw_dir: Path | None, what: str) -> None:
+    """Did every op of the profiled graph run on the NPU? From AI Hub's per-layer compute units.
+
+    A QNN context binary is built for the HTP backend as a whole (an op the HTP cannot run makes the compile
+    or link fail; there is no silent CPU fallback inside it), but this reads it back from the profile anyway:
+    any CPU / GPU layer fails the check. Without per-layer data, a QHAS file (the HTP analyzer's output)
+    is taken as evidence that the graph ran on the HTP."""
+    import json
+
+    detail: list[dict[str, Any]] = []
+    if profile_path and Path(profile_path).is_file():
+        try:
+            detail = json.loads(Path(profile_path).read_text()).get("execution_detail") or []
+        except (OSError, ValueError):
+            detail = []
+    units: dict[str, int] = {}
+    for d in detail:
+        u = str(d.get("compute_unit", "UNKNOWN")).upper()
+        units[u] = units.get(u, 0) + 1
+    if detail:
+        npu = units.get("NPU", 0)
+        check(checks, f"{what}: every op on the NPU", f"{len(detail)} of {len(detail)} on NPU",
+              ", ".join(f"{v} {k}" for k, v in sorted(units.items())), npu == len(detail),
+              "AI Hub's per-layer compute units of the profile job")
+        return
+    qhas = sorted(Path(hw_dir).rglob("*qhas*.json")) if hw_dir and Path(hw_dir).exists() else []
+    check(checks, f"{what}: ran on the NPU", "per-layer compute units, or the HTP analyzer's QHAS file",
+          f"QHAS {qhas[0].name}" if qhas else "no per-layer data and no QHAS file", bool(qhas),
+          "the profile had no per-layer detail")
+
+
 def summarize(checks: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
     return {"ok": bool(checks) and all(c["ok"] for c in checks), "checks": checks, **extra}

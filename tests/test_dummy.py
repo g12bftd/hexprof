@@ -72,6 +72,11 @@ def test_component_knobs_and_warnings():
     v = S.resolve("gemma4-vision", E4B, {"soft-tokens": 70, "hidden": 384, "heads": 6, "kv-heads": 6})
     assert not v.errors and S.expected_io(v)["inputs"]["pixel_values"] == [1, 630, 768]
     assert any("soft-tokens" in e for e in S.resolve("gemma4-vision", E4B, {"soft-tokens": 100}).errors)
+    # vision width: heads follow (Qualcomm's attention rewrite needs hidden = heads x head-dim); text untouched
+    w = S.resolve("gemma4-vision", E4B, {"hidden": 384})
+    assert not w.errors and (w.dims["heads"], w.dims["kv-heads"], w.dims["head-dim"]) == (6, 6, 64)
+    assert w.dims["text-hidden"] == 2560 and w.dims["intermediate"] == 3072 and any("heads follow" in n for n in w.notes)
+    assert any("heads x head-dim" in e for e in S.resolve("gemma4-vision", E4B, {"hidden": 384, "heads": 12}).errors)
 
 
 def test_cli_plan(tmp_path, capsys):

@@ -125,6 +125,8 @@ def verify(axis: str, value: str, vdir: Path, fixed: dict[str, Any], device: str
             continue
         job = hc.get_job(job_id)
         core.device_check(checks, job, device, f"{label}: device")
+        stem = label.replace("/", "__")
+        core.npu_check(checks, vdir / "profiles" / f"{stem}.profile.json", vdir / "hw" / stem, label)
         opts = str(getattr(job, "options", "") or "")
         if "context_enable_graphs" in opts:
             core.check(checks, f"{label}: graph profiled", graph, opts, graph in opts)

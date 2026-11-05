@@ -605,6 +605,10 @@ that what ran is what was asked:
   inputs (= total layers × per-layer width), masks (context, sliding window), RoPE widths (head dims), one
   KV tensor per non-shared layer and KV head, and logits (= vocabulary);
 * the layers inside each exported part;
+* that every op ran on the NPU. AI Hub's per-layer compute units of each profile job must all be NPU; one
+  CPU or GPU op fails the check. A QNN context binary is built for the HTP as a whole, so an unsupported op
+  makes the compile fail rather than fall back, but the check reads it back anyway. This check also applies
+  to the studies of the real models;
 * the job chain (uploaded part → quantized → compiled → linked → profiled), quantize dtypes, device, QAIRT;
 * for vision / SigLIP 2: the config Qualcomm's wrapper actually built, and the image-processor budget.
 
@@ -629,6 +633,10 @@ Be aware of what a dummy is and is not:
   real models are aligned.
 * AI Hub runs each graph on its own. A dummy is not a GenieX bundle; no tokenizer or embedding tables are
   shipped.
+* Gemma 4 vision width: Qualcomm's vision attention rewrite needs `hidden = heads × head-dim`. So
+  `--dims hidden=384` also sets heads 12 → 6 (head-dim 64 kept, like ViT-Base → ViT-Small). The run manifest
+  lists both changes. The vision encoder's output width is the text model's hidden size (`text-hidden`,
+  2560), so a vision-only change leaves every text graph as it is.
 * Qualcomm's vision pooler hard-codes width 768 for its padding tensor. For other widths hexprof rebuilds
   that tensor at the encoder's width (the real model is unaffected). Gemma 4 dummies drop the audio tower,
   and SigLIP 2 dummies shrink the unused tower; neither reaches the NPU.

@@ -110,7 +110,7 @@ def _fake_gemma(monkeypatch, tmp_path, lie_about=None):
                 ms = (40.0 if i == 1 else 10.0) * (ctx / 4096) ** 0.3 * (1 if ar == 1 else 1.6)
                 q = hwfakes.qhas_doc(60, seed=i + ar)
                 hwfakes.write_json(Path(out_dir) / "hw" / label / "qhas" / "j_main_qhas_summary.json", q)
-                hwfakes.write_json(Path(out_dir) / "profiles" / f"{label}.profile.json", hwfakes.profile_doc(ms=ms))
+                hwfakes.write_json(Path(out_dir) / "profiles" / f"{label}.profile.json", hwfakes.profile_doc(ms=ms, cpu=False))
                 parts[f"{comp}/{graph}"] = {"component": comp, "graph": graph, "job": {"job_id": pid}, "model_id": "x"}
         summary = {"parts": parts}
         hwfakes.write_json(Path(out_dir) / "export_profiles.json", summary)
@@ -161,6 +161,9 @@ def test_decode_tokens_metrics(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- single-graph components
+
+
+CPU_OPS: dict = {}
 
 
 def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
@@ -262,7 +265,7 @@ def _fake_qaihm(monkeypatch, tmp_path, ignore_batch=False):
 
     def save_profile(job, out_dir, stem):
         b = next(iter(job.model.input_spec.values()))[0].shape[0]
-        prof = hwfakes.profile_doc(ms=1.0 + 0.2 * b)
+        prof = hwfakes.profile_doc(ms=1.0 + 0.2 * b, cpu=CPU_OPS.get('on', False))
         return prof, hwfakes.write_json(Path(out_dir) / f"{stem}.profile.json", prof)
 
     def download_hw_artifacts(job, out_dir):
@@ -377,3 +380,14 @@ def test_ablation_summary_against_baseline(tmp_path, monkeypatch):
     p = _page(page)
     bars = next(b for s in p["sections"] for b in s["blocks"] if b["type"] == "hbar")
     assert bars["rows"][0]["value"] == pytest.approx(row["items_per_s__ratio"])
+
+
+def test_an_op_on_the_cpu_fails_verification(tmp_path, monkeypatch):
+    """The NPU check: AI Hub's per-layer compute units must all be NPU."""
+    _fake_qaihm(monkeypatch, tmp_path)
+    monkeypatch.setitem(CPU_OPS, "on", True)
+    st = S.run("siglip2-text", "batch", ["1"], {}, str(tmp_path / "cpu"), compare=False)
+    ver = json.loads((tmp_path / "cpu" / "batch-1" / "verification.json").read_text())
+    bad = [c for c in ver["checks"] if not c["ok"]]
+    assert not ver["ok"] and [c["what"] for c in bad] == ["text_encoder: every op on the NPU"]
+    assert "CPU" in bad[0]["actual"]

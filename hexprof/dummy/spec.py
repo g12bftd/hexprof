@@ -253,7 +253,24 @@ def resolve(target: str, base: dict[str, Any], requested: dict[str, int], deploy
         if target == "gemma4-vision":
             dep["soft_tokens"] = want.get("soft-tokens") or 280
             # Qualcomm's VisionEncoder reads the pooler's output length from here; keep it equal to the budget
-            _section(cfg, "vision_config")["default_output_length"] = dep["soft_tokens"]
+            v = _section(cfg, "vision_config")
+            v["default_output_length"] = dep["soft_tokens"]
+            # Qualcomm's vision attention rewrite needs hidden == heads x head-dim: a width change takes the head
+            # count with it (head-dim kept), as ViT-Base (768 = 12 x 64) -> ViT-Small (384 = 6 x 64)
+            hd = want["head-dim"]
+            if "hidden" in requested and not {"heads", "head-dim"} & set(requested) and want["hidden"] % hd == 0:
+                heads = want["hidden"] // hd
+                v["num_attention_heads"] = heads
+                if "kv-heads" not in requested:
+                    rk, rh = real.get("kv-heads", real.get("heads")), real.get("heads")
+                    kv = heads if rk == rh else max(1, round(heads * rk / rh))
+                    while heads % kv:
+                        kv -= 1
+                    v["num_key_value_heads"] = kv
+                r.notes.append(f"heads follow hidden: {real.get('heads')} -> {heads} (head-dim {hd} kept; Qualcomm's "
+                               f"vision attention needs hidden = heads x head-dim)"
+                               + (f", kv-heads {real.get('kv-heads')} -> {v.get('num_key_value_heads')}"
+                                  if "kv-heads" not in requested else ""))
     r.dims = read_dims(target, cfg)
     validate(r)
     return r
@@ -336,6 +353,12 @@ def validate(r: Resolved) -> Resolved:
             err.append(f"soft-tokens must be one of {GEMMA_SOFT_TOKENS} (Gemma 4 image processor budgets)")
         if d["head-dim"] % 2:
             err.append("head-dim must be even (2-D RoPE)")
+        if d["hidden"] != d["heads"] * d["head-dim"]:
+            err.append(f"hidden ({d['hidden']}) must equal heads x head-dim ({d['heads']} x {d['head-dim']} = "
+                       f"{d['heads'] * d['head-dim']}): Qualcomm's vision attention rewrite reshapes the attention "
+                       f"output to the hidden size. Change the head layout with it, e.g. hidden={d['hidden']} "
+                       + (f"heads={d['hidden'] // d['head-dim']} kv-heads={d['hidden'] // d['head-dim']} (head-dim "
+                          f"{d['head-dim']} kept)" if d["hidden"] % d["head-dim"] == 0 else "with matching heads"))
     elif t in ("siglip2-image", "siglip2-text"):
         if d["hidden"] % d["heads"]:
             err.append(f"hidden ({d['hidden']}) must be a multiple of heads ({d['heads']}): SigLIP derives head_dim")

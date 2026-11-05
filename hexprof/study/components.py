@@ -258,6 +258,8 @@ def verify(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any]
         linked = [m.model_id for m in (getattr(ljob, "models", None) or [])]
         core.check(checks, "link job consumed the compiled model", compiled.model_id, linked, compiled.model_id in linked)
     core.device_check(checks, pjob, device, "profile device")
+    comp = s["component"]
+    core.npu_check(checks, vdir / comp / f"{comp}.profile.json", vdir / comp, comp)
     if axis == "batch":
         b = int(value)
         core.check(checks, "batch dimension", b, {k: d[0] for k, d in built.items()},
