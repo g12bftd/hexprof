@@ -230,3 +230,23 @@ def test_limiter_needs_a_measured_peak_to_be_reached():
     assert limiter(35.0, 39.2) == "neither roof"  # Gemma 4 prefill: below both roofs
     assert limiter(70.0, 20.0) == "compute (P)"
     assert limiter(None, None) is None
+
+
+def test_graphs_table_links_each_graph_to_its_workbench_job(tmp_path):
+    import json
+    import re
+
+    from hexprof.hwreport import report as R
+
+    root = tmp_path / "exp"
+    hwfakes.gemma_export_layout(root, parts=2)
+    labels = sorted(p.name for p in (root / "hw").iterdir())
+    (root / "export_profiles.json").write_text(json.dumps({"parts": {
+        lab.replace("__", "/", 1): {"component": lab.split("__")[0], "graph": lab.split("__")[1], "job": {"job_id": f"j{i}"}}
+        for i, lab in enumerate(labels)}}))
+    R.build([root], root / "hw_report")
+    page = json.loads(re.search(r'id="data">(.*?)</script>', (root / "hw_report" / "index.html").read_text(), re.S).group(1))
+    table = next(s for s in page["sections"] if s["title"] == "Graphs")["blocks"][0]["table"]
+    assert any(c["key"] == "job" and c.get("link") == "job_url" for c in table["cols"])
+    row = table["rows"][0]
+    assert row["job_url"] == f"https://workbench.aihub.qualcomm.com/jobs/{row['job']}/"

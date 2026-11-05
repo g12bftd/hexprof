@@ -71,6 +71,10 @@ class Graph:
     info: dict[str, Any] | None = None  # AI Hub model facts from `hexprof hw fetch-models`
     io: dict[str, Any] = field(default_factory=dict)  # inputs / outputs and what they mean
     out: dict[str, Any] = field(default_factory=dict)
+    job_id: str | None = None  # the AI Hub profile job behind "AI Hub ms" (Workbench page: WORKBENCH_JOB)
+
+
+WORKBENCH_JOB = "https://workbench.aihub.qualcomm.com/jobs/{}/"
 
 
 def discover(paths: Sequence[str | Path]) -> list[Graph]:
@@ -882,6 +886,7 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
         pk = ah.get("estimated_peak_memory_range_mb") or {}
         ot = g.out.get("optrace") or {}
         rows.append({"label": short_label(g.label), "folder": g.label, "href": f"{g.label}.html",
+                     "job": g.job_id, "job_url": WORKBENCH_JOB.format(g.job_id) if g.job_id else None,
                      "time_ms": k["time_us"] / 1e3 if k.get("time_us") else None,
                      "util": k.get("percent_utilization"), "ips": k.get("inf_per_s"), "dram": k.get("total_dram"),
                      "dram_gbps": k.get("dram_gbps"), "vtcm": k.get("total_vtcm"), "vtcm_gbps": k.get("vtcm_gbps"),
@@ -945,6 +950,8 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
                          "blocks": blocks_e2e})
     cols = [{"key": "label", "label": "Graph", "kind": "str", "link": "href"},
             {"key": "aihub_ms", "label": "AI Hub ms", "kind": "num"}]
+    if any(r["job"] for r in rows):  # click through to the Workbench job page that shows this inference time
+        cols.append({"key": "job", "label": "AI Hub profile job", "kind": "str", "link": "job_url"})
     if any(r["published_ms"] for r in rows):
         cols.append({"key": "published_ms", "label": "Published ms", "kind": "num"})
     cols += [{"key": "time_ms", "label": "QHAS ms", "kind": "num"},
@@ -1049,8 +1056,10 @@ def build(paths: Sequence[str | Path], out_dir: str | Path, top: int = 15, bins:
     print("Ceilings: " + (", ".join(f"P[{k}] = {v:.2f} TOPS" for k, v in ctx.P.items()) or "no P")
           + "; " + (f"B = {ctx.B:.1f} GB/s ({ctx.B_series})" if ctx.B else f"no B (theoretical {theory_gbps:g} GB/s used)"))
     infos = MD.load_infos([Path(p) if Path(p).is_dir() else Path(p).parent for p in paths])
+    refs = MD.job_refs(paths)  # export_profiles.json / profile.json: the profile job of every graph
     for g in graphs:
         g.info = infos.get(g.label)
+        g.job_id = (refs.get(g.label) or {}).get("job_id")
     if infos:
         print(f"AI Hub model facts for {sum(1 for g in graphs if g.info)} of {len(graphs)} graphs")
     for i, g in enumerate(graphs, 1):

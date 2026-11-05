@@ -140,7 +140,7 @@ def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Pa
                 fixed["reference_options"] = ro
                 rl.add(extra={"job options": f"copied from your real export's jobs {ro['jobs']} "
                                              f"(QAIRT {ro.get('qairt')} pinned)"})
-            SC.run_one(target, "dummy", "-", out, fixed, device)
+            SC.run_one(target, "dummy", out.name, out, fixed, device)  # job names on Workbench carry the folder
             ver = verify_component(out, device, reference)
         write_json(out / "verification.json", ver)
         _print_verification(ver)
