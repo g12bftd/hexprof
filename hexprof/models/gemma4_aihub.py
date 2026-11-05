@@ -54,31 +54,57 @@ _GRAPH_RE = re.compile(r"(prompt|token)_ar(\d+)_cl(\d+)")
 # --------------------------------------------------------------------------- export
 
 
-def default_export_dir() -> Path:
+def default_export_dir(context_length: int | None = None, prompt_length: int | None = None) -> Path:
+    """``gemma4-s25-export`` for Qualcomm's settings; a separate folder per changed context / prompt length."""
     base = os.environ.get("HEXPROF_DOWNLOAD_DIR")
-    return Path(base) / "gemma4-s25-export" if base else Path("runs") / "gemma4-s25-export"
+    name = "gemma4-s25-export" + (f"-cl{context_length}" if context_length else "") + (
+        f"-ar{prompt_length}" if prompt_length else "")
+    return Path(base) / name if base else Path("runs") / name
+
+
+def export_flags(context_length: int | None = None, prompt_length: int | None = None) -> list[str]:
+    """Qualcomm export flags for a changed KV-cache length / prompt chunk (None = Qualcomm's 4096 / 128)."""
+    flags: list[str] = []
+    if context_length:
+        flags += ["--context-lengths", str(int(context_length))]
+    if prompt_length:
+        flags += ["--sequence-lengths", str(int(prompt_length)), "1"]
+    return flags
 
 
 def ensure_export(export_dir: str | Path, device_name: str, checkpoint: str = "DEFAULT",
-                  target_runtime: str = "geniex_qairt", hw: bool = True, force: bool = False) -> dict[str, Any]:
+                  target_runtime: str = "geniex_qairt", hw: bool = True, force: bool = False,
+                  context_length: int | None = None, prompt_length: int | None = None) -> dict[str, Any]:
     """Compile + profile Gemma 4 on AI Hub once; later calls reuse ``export_profiles.json``."""
     export_dir = Path(export_dir)
     state = export_dir / EXPORT_STATE
+    flags = export_flags(context_length, prompt_length)
     if state.exists() and not force:
         summary = read_json(state)
         if summary.get("parts"):
+            had = summary.get("export_flags", [])
+            if had != flags:
+                raise ValueError(f"{export_dir} holds an export made with flags {had or '(none)'}, not {flags or '(none)'}; "
+                                 "use another --export-dir or --force-export")
             print(f"Re-using the compiled Gemma 4 graphs profiled in {export_dir}")
             return summary
+    from hexprof import runlog
     from hexprof.pipeline import gemma4_export
 
     gemma4_export._require_qaihm()
     print("One-time step: compiling Gemma 4 E4B (w4a16) on AI Hub and profiling every graph on "
           f"{device_name}. This downloads Qualcomm's 18.7 GB checkpoint and can take a few hours.")
-    result = gemma4_export.run_official_export(checkpoint, export_dir, device_name, target_runtime,
-                                               "w4a16", extra=["--skip-downloading"])
-    summary = gemma4_export.collect(result, export_dir, hw)
-    summary.update(device=device_name, checkpoint=checkpoint, target_runtime=target_runtime)
-    write_json(state, summary)
+    extra = ["--skip-downloading", *flags]
+    model, settings, info = gemma4_export.manifest(checkpoint, export_dir, device_name, target_runtime, "w4a16", extra)
+    with runlog.run(export_dir, kind="gemma4-export", title="Gemma 4 E4B on AI Hub: Qualcomm export, every graph profiled",
+                    model=model, settings=settings, device=device_name, runtime=info["runtime"],
+                    extra=info["extra"]) as run:
+        result = gemma4_export.run_official_export(checkpoint, export_dir, device_name, target_runtime,
+                                                   "w4a16", extra=extra)
+        summary = gemma4_export.collect(result, export_dir, hw)
+        summary.update(device=device_name, checkpoint=checkpoint, target_runtime=target_runtime, export_flags=flags)
+        write_json(state, summary)
+        run.result(**gemma4_export.latency_results(summary))
     return summary
 
 
@@ -234,6 +260,8 @@ def infer(
     gguf: str = LOCAL_GGUF,
     mmproj: str | None = None,
     hf_repo: str = HF_REPO,
+    context_length: int | None = None,
+    prompt_length: int | None = None,
 ) -> dict[str, Any]:
     if not images or not prompts:
         raise ValueError("give at least one --image and one --prompt")
@@ -242,7 +270,27 @@ def infer(
             raise FileNotFoundError(i)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    summary = ensure_export(export_dir or default_export_dir(), device_name, checkpoint, hw=hw)
+    export_dir = export_dir or default_export_dir(context_length, prompt_length)
+    summary = ensure_export(export_dir, device_name, checkpoint, hw=hw, context_length=context_length,
+                            prompt_length=prompt_length)
+    from hexprof import runlog
+
+    with runlog.run(out, kind="gemma4-aihub", title="Gemma 4 E4B on AI Hub: your images and prompts",
+                    model={"name": "Gemma 4 E4B-it (google/gemma-4-E4B-it)",
+                           "weights": f"the Qualcomm export in {export_dir} (checkpoint {checkpoint})"},
+                    settings=[runlog.setting("export flags", " ".join(export_flags(context_length, prompt_length)) or
+                                             "(none)", "(none)", group="export")],
+                    device=device_name, runtime="QNN context binary (vision encoder run on your images)",
+                    extra={"images": [str(i) for i in images], "prompts": len(prompts), "max_new_tokens": max_new_tokens}) as run:
+        report = _infer(images, prompts, out, device_name, export_dir, summary, local, llama_cli, gguf, mmproj, hf_repo,
+                        max_new_tokens)
+        run.result(requests=len(report["results"]), context_length=report["context_length"])
+    return report
+
+
+def _infer(images: Sequence[str | Path], prompts: Sequence[str], out: Path, device_name: str, export_dir: str | Path,
+           summary: dict[str, Any], local: str, llama_cli: str | None, gguf: str, mmproj: str | None, hf_repo: str,
+           max_new_tokens: int) -> dict[str, Any]:
     parts = split_parts(summary)
     if not parts["prefill"] or not parts["decode"]:
         raise RuntimeError("the export has no prefill/decode profiles; re-run with --force-export")
@@ -269,7 +317,7 @@ def infer(
                             "image_size_fed": prep.get("image_size_fed")})
     report = {
         "device": device_name,
-        "export_dir": str(export_dir or default_export_dir()),
+        "export_dir": str(export_dir),
         "graphs": {
             "vision_encoder": parts["vision"]["metrics"] if parts["vision"] else None,
             "prefill": {r["graph"]: r["metrics"] for r in parts["prefill"]},

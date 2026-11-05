@@ -36,11 +36,23 @@ def run(target: str, axis: str, values: Sequence[str], fixed: dict[str, Any], ou
         study.save()
     one, verify = _runners(target)
     print(f"Study {target} / {axis}: values {study.values}; fixed {fixed}; device {device}; results in {study.out}")
-    if target == "gemma4-text":
-        study.run(lambda v, d: one(axis, v, d, fixed, device), lambda v, d: verify(axis, v, d, fixed, device), force)
-    else:
-        study.run(lambda v, d: one(target, axis, v, d, fixed, device),
-                  lambda v, d: verify(target, axis, v, d, fixed, device), force)
+    from hexprof import runlog
+
+    base = core.baseline_of(study.state)
+    settings = [runlog.setting(f"{axis} (swept)", list(study.values), base, group="study",
+                               note="each value is its own deployment with its own run_manifest.md")]
+    settings += [runlog.setting(k.replace("_", " "), v, None, group="fixed") for k, v in fixed.items()]
+    with runlog.run(study.out, kind="study", title=f"Study {target}: {axis} sweep on AI Hub",
+                    model={"name": target, "weights": ("random dummy weights" if target.startswith("dummy-")
+                                                       else "Qualcomm AI Hub model / published checkpoint")},
+                    settings=settings, device=device, extra={"values": study.values, "reference value": base}) as rl:
+        if target == "gemma4-text":
+            study.run(lambda v, d: one(axis, v, d, fixed, device), lambda v, d: verify(axis, v, d, fixed, device), force)
+        else:
+            study.run(lambda v, d: one(target, axis, v, d, fixed, device),
+                      lambda v, d: verify(target, axis, v, d, fixed, device), force)
+        rl.result(**{f"{axis}={v}": f"{r.get('status')}, " + ("verified" if r.get("verified") else "NOT verified")
+                     for v, r in study.state["variants"].items()})
     if compare:
         from hexprof.study.compare import compare as cmp
 

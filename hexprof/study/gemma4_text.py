@@ -69,7 +69,9 @@ def run_one(axis: str, value: str, vdir: Path, fixed: dict[str, Any], device: st
                          f"expected {sorted(seqs)} and [{ctx}]")
     print(f"    export flags: {' '.join(flags)}  (parsed: sequence_lengths={got_seq}, context_lengths={got_ctx}, "
           f"components={parsed.get('components')})", flush=True)
-    summary = gemma4_export.export(checkpoint, vdir, device, runtime, "w4a16", flags, hw=True)
+    summary = gemma4_export.export(checkpoint, vdir, device, runtime, "w4a16", flags, hw=True,
+                                   title=f"Gemma 4 E4B text parts on AI Hub ({axis} = {value})",
+                                   run_extra={"study": f"{axis} = {value}"})
     return {"flags": flags, "parsed": {k: parsed.get(k) for k in ("sequence_lengths", "context_lengths", "components")},
             "graphs": sorted(summary.get("parts", {}))}
 

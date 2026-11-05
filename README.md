@@ -119,6 +119,10 @@ hexprof gemma4 aihub --download-dir ~/hexprof-data --image photo.jpg --prompt "W
   estimated for `--max-new-tokens` tokens. `--local-answer off` skips it.
 * Output in `runs/gemma4-aihub-<time>/`: `results.md` with the answer and the stage table, `results.json`,
   and the vision encoder's output embeddings as `.npy`.
+* Another KV-cache length or prompt chunk with Qualcomm's real weights: `--context-length 2048` and/or
+  `--prompt-length 256`. These are Qualcomm's own export flags (`--context-lengths`, `--sequence-lengths N 1`),
+  and the export goes to its own folder (`gemma4-s25-export-cl2048`). An export folder refuses to be reused
+  with other flags. A smaller *hidden size* cannot come from the real weights; see `hexprof dummy`.
 
 ### How well each part uses the NPU
 
@@ -422,18 +426,45 @@ w4/w8/a16/kv8 recipe. `export` then compiles, links and profiles every (part, gr
 collects the metrics plus optrace/QHAS for each, and builds the GenieX QAIRT bundle.
 `--context-length` is the shorter-KV-cache optimisation from the plan.
 
+## Run log: what was deployed, with which settings, on which hardware
+
+Every command that deploys something on AI Hub opens a run log (`hexprof/runlog.py`). That covers
+`gemma4 aihub`, `pipeline gemma4 export`, `siglip2 infer|profile`, `study run`, `dummy run`,
+`ceilings compute|bandwidth|kv` and `hub profile`. At the start it prints a banner, which lands at the top
+of the Slurm `.out` file, and writes `run_manifest.json` and `run_manifest.md` into the results folder:
+
+* **verdict**: one line, e.g. `Qualcomm AI Hub base model, Qualcomm's settings`,
+  `Qualcomm AI Hub base model, 1 change(s): context lengths [4096] -> [2048]` or
+  `SHRUNK DUMMY (random weights), 2 change(s): hidden 2560 -> 1280, intermediate 10240 -> 5120`;
+* **model**: name, weights (Qualcomm's published checkpoint or asset, random dummy weights, your
+  checkpoint), the code that built it, and the architecture;
+* **settings**: every setting next to Qualcomm's (or the real model's) value, changes marked. For Gemma 4
+  exports these are what Qualcomm's own export parser reads from the arguments, against what it reads
+  with none;
+* **hardware**: AI Hub device, SoC, chipset, Hexagon version (from AI Hub's device attributes when
+  reachable), NPU facts (VTCM, HVX / HMX units, theoretical DRAM bandwidth), runtime, QAIRT version
+  requested;
+* **environment**: hexprof commit, command line, host, Slurm job, package versions.
+
+While the run is open, every AI Hub job is logged, including the ones Qualcomm's export code submits. Each
+job gets one stdout line (kind, id, name, device, URL) and a line in `jobs_log.jsonl`. At the end the run
+records its status and duration. It also records the final state of every job (failed ones are listed with
+AI Hub's message), the device, OS and QAIRT version AI Hub reports for the profile jobs, and the headline
+results (per-graph latency, decode / prompt sums, verification). The hardware report shows the
+manifest as its first section, "What was deployed".
+
 ## Slurm jobs (CSCS Alps / Daint)
 
 `slurm/` holds the three batch jobs for the hosted-S25 workflow:
 
 | Script | Runs | Results |
 |---|---|---|
-| `slurm/gemma4_profile.sh` | `hexprof gemma4 aihub --export-only`: compile Gemma 4 and profile every part | `$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/` |
+| `slurm/gemma4_profile.sh` | `hexprof gemma4 aihub --export-only [args]`: compile Gemma 4 and profile every part; `--context-length N` / `--prompt-length N` change Qualcomm's 4096 / 128 | `$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/` (`…-cl<N>` when changed) |
 | `slurm/siglip2_profile.sh` | `hexprof siglip2 profile`: image and text encoders | `$HEXPROF_DOWNLOAD_DIR/runs/siglip2-profile-<jobid>/` |
 | `slurm/ceilings.sh` | `hexprof ceilings compute` (w8a16, w4a16, fp16) and `ceilings bandwidth` (w4a16); resumable | `$HEXPROF_DOWNLOAD_DIR/runs/ceil-compute/`, `runs/ceil-bandwidth/` |
 | `slurm/study.sh` | `hexprof study run …` with the arguments you pass (one sweep, verified and compared) | `$HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>/comparison/` |
 | `slurm/dummy.sh` | `hexprof dummy run …`: one shrunk random-weight model, deployed, profiled, verified | `$HEXPROF_DOWNLOAD_DIR/dummy/<target>__<knobs>/` |
-| `slurm/hw_report.sh` | `hexprof hw fetch-models` + `hexprof hw report` on both profiling results, with the ceilings when present | `…/hw_report/index.html` in each |
+| `slurm/hw_report.sh [dir …]` | `hexprof hw fetch-models` + `hexprof hw report` on every `gemma4-s25-export*` and SigLIP 2 result (or on the folders you pass), with the ceilings when present | `…/hw_report/index.html` in each |
 
 ```bash
 mkdir -p /capstor/scratch/cscs/$USER/job_logs/hexprof

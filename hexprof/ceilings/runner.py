@@ -222,6 +222,29 @@ class Sweep:
             self._save()
 
     def run(self, specs: Sequence[PointSpec]) -> list[dict[str, Any]]:
+        from hexprof import runlog
+
+        series = sorted({s.series for s in specs})
+        precs = sorted({s.precision.name for s in specs})
+        settings = [runlog.setting("graphs", len(specs), None, group="sweep"),
+                    runlog.setting("series", series, None, group="sweep"),
+                    runlog.setting("precisions", precs, None, group="sweep"),
+                    runlog.setting("target runtime", self.runtime, None, group="deployment"),
+                    runlog.setting("calibration samples", self.n_calib, None, group="deployment"),
+                    runlog.setting("compile options", self.compile_options or "(none)", None, group="deployment")]
+        with runlog.run(self.out, kind="ceilings", title=f"NPU ceiling sweep: {', '.join(series)}",
+                        model={"name": "synthetic ceiling graphs (hexprof.ceilings.graphs)",
+                               "weights": "synthetic random weights", "source": ", ".join(s.key for s in specs[:12])
+                               + (" ..." if len(specs) > 12 else "")},
+                        settings=settings, device=self.device_name,
+                        runtime="QNN context binary (compile to qnn_dlc, link)" if self.links else self.runtime,
+                        qairt=self.qairt_version, extra={"dry_run": self.dry_run} if self.dry_run else None) as rl:
+            states = self._run(specs)
+            rl.result(**{s["key"]: f"{s.get('latency_ms')} ms" if s.get("latency_ms") is not None else s.get("error", "-")
+                         for s in states})
+            return states
+
+    def _run(self, specs: Sequence[PointSpec]) -> list[dict[str, Any]]:
         print(f"{len(specs)} graph(s) -> {self.out}")
         self._build_and_upload(specs)
         if self.dry_run:

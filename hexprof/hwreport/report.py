@@ -708,6 +708,50 @@ def requests_section(paths: Sequence[str | Path], graphs: list[Graph]) -> dict[s
                 {"key": "output", "label": "Output", "kind": "str"}], "rows": rows}}]}
 
 
+def deployment_section(paths: Sequence[str | Path]) -> dict[str, Any] | None:
+    """What was deployed, from the run manifest(s) hexprof wrote next to the results (hexprof.runlog)."""
+    found: list[dict[str, Any]] = []
+    for p in map(Path, paths):
+        root = p if p.is_dir() else p.parent
+        for f in sorted(root.glob("run_manifest.json")) + sorted(root.glob("*/run_manifest.json")):
+            try:
+                found.append(json.loads(f.read_text()))
+            except (OSError, ValueError):
+                continue
+    if not found:
+        return None
+    blocks: list[dict[str, Any]] = []
+    for m in found:
+        hw, mod = m.get("hardware") or {}, m.get("model") or {}
+        rep = hw.get("as_reported_by_aihub") or {}
+        facts = [{"what": "verdict", "value": m.get("verdict")}, {"what": "model", "value": mod.get("name")},
+                 {"what": "weights", "value": mod.get("weights")},
+                 {"what": "architecture", "value": ", ".join(f"{k} {v}" for k, v in (mod.get("architecture") or {}).items())},
+                 {"what": "device", "value": f"{hw.get('device')} ({hw.get('soc')}, Hexagon {hw.get('hexagon')})"},
+                 {"what": "ran on (AI Hub)", "value": "; ".join(f"{k} {', '.join(v)}" for k, v in rep.items()) or None},
+                 {"what": "runtime", "value": hw.get("runtime")},
+                 {"what": "run", "value": f"{m.get('run_id')}: {m.get('status')}, {m.get('duration_min')} min, "
+                                          f"hexprof {(m.get('environment') or {}).get('hexprof_commit')}"}]
+        setting_rows = [{"changed": "changed" if x.get("changed") else "", "group": x.get("group"),
+                         "setting": x.get("setting"), "value": str(x.get("value")),
+                         "base": "" if x.get("base") is None else str(x.get("base")), "note": x.get("note") or ""}
+                        for x in m.get("settings") or []]
+        blocks.append({"type": "note", "text": m.get("title") or "", "table": {"open": True, "cols": [
+            {"key": "what", "label": "", "kind": "str"}, {"key": "value", "label": "", "kind": "str"}],
+            "rows": [r for r in facts if r["value"]]}})
+        if setting_rows:
+            blocks.append({"type": "note", "text": "Settings (base = Qualcomm's / the real model's value)",
+                           "table": {"open": True, "cols": [
+                               {"key": "changed", "label": "", "kind": "str"}, {"key": "group", "label": "Group", "kind": "str"},
+                               {"key": "setting", "label": "Setting", "kind": "str"},
+                               {"key": "value", "label": "Value", "kind": "str"},
+                               {"key": "base", "label": "Base", "kind": "str"},
+                               {"key": "note", "label": "Note", "kind": "str"}], "rows": setting_rows}})
+    return {"title": "What was deployed", "why": "From run_manifest.json, written by the command that deployed these "
+            "graphs: the model, every setting next to Qualcomm's (or the real model's) value, and the hardware AI Hub "
+            "reported for the profile jobs.", "blocks": blocks}
+
+
 def _img_size(path: Any) -> str | None:
     try:
         from PIL import Image
@@ -782,7 +826,7 @@ def _stack_block(rows: list[dict[str, Any]], series: list[str], title: str) -> d
 
 
 def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
-                  requests_sec: dict[str, Any] | None = None) -> dict[str, Any]:
+                  requests_sec: dict[str, Any] | None = None, deployed_sec: dict[str, Any] | None = None) -> dict[str, Any]:
     rows = []
     for g in graphs:
         k = g.out.get("qhas", {}).get("kpis", {})
@@ -842,6 +886,8 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
                              {"key": "output", "label": "Output", "kind": "str"}], "rows": io_rows}}]})
     if requests_sec:
         sections.append(requests_sec)
+    if deployed_sec:
+        sections.insert(0, deployed_sec)
     if blocks_e2e:
         sections.append({"title": "End to end (from the parts)", "why": "Decode = 1 ÷ (sum of the token graphs); prefill = "
                          "chunk length ÷ (sum of the prompt graphs).", "blocks": blocks_e2e})
@@ -962,7 +1008,8 @@ def build(paths: Sequence[str | Path], out_dir: str | Path, top: int = 15, bins:
         page = graph_page(g, out, top, bins, ctx)
         (out / f"{g.label}.html").write_text(H.render_page(_jsonable(page)), encoding="utf-8")
         print(f"    done in {time.time() - t:.1f} s", flush=True)
-    ov = overview_page(graphs, title or "NPU hardware report", ctx, requests_section(requests, graphs))
+    ov = overview_page(graphs, title or "NPU hardware report", ctx, requests_section(requests, graphs),
+                       deployment_section(paths))
     (out / "index.html").write_text(H.render_page(_jsonable(ov)), encoding="utf-8")
     write_json(out / "summary.json", {"_ceilings": {"P_tops": ctx.P, "B_gbps": ctx.B, "B_series": ctx.B_series,
                                                     "theoretical_gbps": theory_gbps, **ctx.ceilings_src},

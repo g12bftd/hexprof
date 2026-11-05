@@ -257,7 +257,50 @@ def summarize_hw(arts: dict[str, list[str]], layer_rows: list[dict[str, Any]], b
     return out
 
 
-def infer(
+def _run_log(bundle_dir: str | Path, out_dir: str | Path, what: str, components: Sequence[str], device_name: str,
+             qairt_version: str | None, options: str, extra: dict[str, Any] | None = None) -> Any:
+    """The run log (hexprof.runlog) of a SigLIP 2 deployment from Qualcomm's pre-built asset bundle."""
+    from hexprof import runlog as RL
+
+    b = Bundle.load(bundle_dir)
+    settings = [RL.setting("precision", b.precision, "w8a16", group="deployment", note="Qualcomm publishes w8a16 and float"),
+                RL.setting("runtime", b.runtime, "qnn_dlc", group="deployment"),
+                RL.setting("components", list(components), None, group="deployment"),
+                RL.setting("QAIRT", qairt_version or b.qairt_version or "AI Hub default", b.qairt_version or "AI Hub default",
+                           group="deployment", note="the bundle's QAIRT version unless --qairt-version"),
+                RL.setting("extra options", options or "(none)", "(none)", group="deployment")]
+    model = {"name": "SigLIP 2 base patch16-224 (google/siglip2-base-patch16-224)",
+             "weights": f"Qualcomm AI Hub published asset bundle ({b.precision}, {b.runtime})",
+             "source": str(b.root),
+             "architecture": {"image": "224×224, patch 16, 12 layers, hidden 768", "text": "64 tokens, 12 layers, hidden 768"}}
+    return RL.run(out_dir, kind="siglip2", title=f"SigLIP 2 on AI Hub: {what}", model=model, settings=settings,
+                  device=device_name, runtime=f"{b.runtime} (Qualcomm's compiled asset)", qairt=qairt_version,
+                  extra=extra)
+
+
+def infer(images: Sequence[str | Path], bundle_dir: str | Path, out_dir: str | Path, labels: Sequence[str] | None = None,
+          device_name: str = "Samsung Galaxy S25", qairt_version: str | None = None, options: str = "", hw: bool = True,
+          logit_scale: float | None = None, logit_bias: float | None = None) -> dict[str, Any]:
+    comps = ["image_encoder"] + (["text_encoder"] if labels else [])
+    with _run_log(bundle_dir, out_dir, "your images" + (" and labels" if labels else ""), comps, device_name,
+                  qairt_version, options, {"images": [str(i) for i in images], "labels": list(labels or [])}) as run:
+        r = _infer(images, bundle_dir, out_dir, labels, device_name, qairt_version, options, hw, logit_scale, logit_bias)
+        run.result(**{f"{c} ms": (r.get(c) or {}).get("metrics", {}).get("inference_time_milliseconds") for c in comps})
+        return r
+
+
+def profile(bundle_dir: str | Path, out_dir: str | Path, components: Sequence[str] = ("image_encoder",),
+            device_name: str = "Samsung Galaxy S25", qairt_version: str | None = None, options: str = "",
+            hw: bool = True) -> dict[str, Any]:
+    """AI Hub profile job (random inputs) per component, like AI Hub's own scorecard."""
+    with _run_log(bundle_dir, out_dir, "profile (random inputs, like AI Hub's scorecard)", components, device_name,
+                  qairt_version, options) as run:
+        r = _profile(bundle_dir, out_dir, components, device_name, qairt_version, options, hw)
+        run.result(**{f"{c} ms": rec["metrics"].get("inference_time_milliseconds") for c, rec in r["components"].items()})
+        return r
+
+
+def _infer(
     images: Sequence[str | Path],
     bundle_dir: str | Path,
     out_dir: str | Path,
@@ -341,7 +384,7 @@ def infer_markdown(r: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def profile(
+def _profile(
     bundle_dir: str | Path,
     out_dir: str | Path,
     components: Sequence[str] = ("image_encoder",),
@@ -350,7 +393,6 @@ def profile(
     options: str = "",
     hw: bool = True,
 ) -> dict[str, Any]:
-    """AI Hub profile job (random inputs) per component, like AI Hub's own scorecard."""
     bundle = Bundle.load(bundle_dir)
     out = Path(out_dir)
     dev = hc.device(device_name)

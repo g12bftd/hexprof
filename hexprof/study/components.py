@@ -91,7 +91,54 @@ def _staged(state: dict[str, Any], path: Path, key: str, submit: Any) -> Any:
     return obj
 
 
+MODEL_NAMES = {"gemma4-vision": ("Gemma 4 E4B vision encoder (VEG)", "google/gemma-4-E4B-it"),
+               "siglip2-image": ("SigLIP 2 image encoder", "google/siglip2-base-patch16-224"),
+               "siglip2-text": ("SigLIP 2 text encoder", "google/siglip2-base-patch16-224")}
+
+
+def run_manifest(target: str, axis: str, value: str, s: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """(model, settings against Qualcomm's, other facts) for the run log of one component deployment."""
+    from hexprof import runlog as RL
+
+    mod, cls, _, default_prec = TARGETS[target]
+    name, repo = MODEL_NAMES[target]
+    if s.get("dummy"):
+        weights = f"random dummy weights ({s['from_kwargs'].get(CKPT_KW[target])})"
+    else:
+        weights = f"Qualcomm AI Hub model ({mod}.{cls}) with the published Hugging Face weights {repo}"
+    st = [RL.setting("precision", s["precision"], default_prec, group="deployment"),
+          RL.setting("QAIRT", s.get("qairt") or "qai_hub_models' pin", "qai_hub_models' pin", group="deployment")]
+    if target in BATCH_KW:
+        st.append(RL.setting("batch", s["spec_kwargs"].get(BATCH_KW[target], 1), 1, group="deployment"))
+    if target == "gemma4-vision" and not s.get("dummy"):  # a dummy lists it as its soft-tokens knob
+        st.append(RL.setting("image token budget (soft tokens)", s.get("soft_tokens") or 280, 280, group="deployment"))
+    if s.get("litemp") or axis == "mixed-precision":
+        lm = s.get("litemp") or {}
+        st.append(RL.setting("mixed precision (% layers at higher precision)", lm.get("percentage", 0), 0, group="deployment",
+                             note=f"override {lm.get('override')}" if lm else ""))
+    for k, v in s["spec_kwargs"].items():
+        if k not in (BATCH_KW.get(target),):
+            st.append(RL.setting(k, v, None, group="input shape"))
+    model = {"name": name + (" (shrunk dummy)" if s.get("dummy") else ""), "weights": weights,
+             "source": f"qai_hub_models {mod}.{cls}.from_pretrained({s['from_kwargs'] or ''})"}
+    return model, st, {"study": f"{axis} = {value}" if axis not in ("dummy",) else None}
+
+
 def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any], device: str) -> dict[str, Any]:
+    from hexprof import runlog
+
+    s = settings(target, axis, value, fixed)
+    model, st, extra = run_manifest(target, axis, value, s)
+    with runlog.run(vdir, kind="component", title=f"{MODEL_NAMES[target][0]} on AI Hub"
+                    + (f" ({axis} = {value})" if axis != "dummy" else ""), model=model, settings=st, device=device,
+                    runtime="QNN context binary (compile to qnn_dlc, link)", qairt=s.get("qairt"),
+                    extra={k: v for k, v in extra.items() if v}) as run:
+        info = _run_one(target, axis, value, vdir, fixed, device)
+        run.result(inference_ms=info.get("inference_ms"), quantized=bool(info["jobs"].get("quantize_job")))
+        return info
+
+
+def _run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any], device: str) -> dict[str, Any]:
     import qai_hub as hub  # type: ignore[import-not-found]
     from qai_hub_models import Precision, TargetRuntime  # type: ignore[import-not-found]
     from qai_hub_models.utils.export.compile import run_compile  # type: ignore[import-not-found]

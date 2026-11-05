@@ -189,19 +189,22 @@ def cmd_gemma4_profile(args: argparse.Namespace) -> int:
 def cmd_gemma4_aihub(args: argparse.Namespace) -> int:
     from hexprof.models import gemma4_aihub
 
-    export_dir = Path(args.export_dir) if args.export_dir else gemma4_aihub.default_export_dir()
+    cl, ar = args.context_length, args.prompt_length
+    export_dir = Path(args.export_dir) if args.export_dir else gemma4_aihub.default_export_dir(cl, ar)
     if args.export_only:
-        gemma4_aihub.ensure_export(export_dir, args.device, args.checkpoint, hw=not args.no_hw, force=args.force_export)
+        gemma4_aihub.ensure_export(export_dir, args.device, args.checkpoint, hw=not args.no_hw, force=args.force_export,
+                                   context_length=cl, prompt_length=ar)
         return 0
     if args.force_export:
-        gemma4_aihub.ensure_export(export_dir, args.device, args.checkpoint, hw=not args.no_hw, force=True)
+        gemma4_aihub.ensure_export(export_dir, args.device, args.checkpoint, hw=not args.no_hw, force=True,
+                                   context_length=cl, prompt_length=ar)
     images = _expand_images(args.image)
     if not images:
         raise SystemExit("give at least one --image (file or folder)")
     gemma4_aihub.infer(images, _read_prompts(args), run_dir(args.out, "gemma4-aihub"), device_name=args.device,
                        export_dir=export_dir, checkpoint=args.checkpoint, hw=not args.no_hw,
                        max_new_tokens=args.max_new_tokens, local=args.local_answer, llama_cli=args.llama_cli,
-                       gguf=args.gguf, mmproj=args.mmproj, hf_repo=args.hf_repo)
+                       gguf=args.gguf, mmproj=args.mmproj, hf_repo=args.hf_repo, context_length=cl, prompt_length=ar)
     return 0
 
 
@@ -263,15 +266,23 @@ def cmd_hub_profile(args: argparse.Namespace) -> int:
     from hexprof.aihub import client as hc
     from hexprof.aihub.metrics import aihub_metrics, metrics_markdown
 
+    from hexprof import runlog
+
     out = run_dir(args.out, "hub-profile")
-    model: Any = args.model if Path(args.model).exists() else hc.get_model(args.model)
-    job = hc.submit_inference(model, hc.device(args.device), None, profile=True, name="hexprof profile",
-                              options=args.options)
-    print(f"profile job {job.job_id}: {job.url}")
-    prof, _ = hc.save_profile(job, out, job.job_id)
-    print(metrics_markdown(f"{args.model} on {args.device}", aihub_metrics(prof)))
-    if args.hw:
-        print(hc.download_hw_artifacts(job, out / "hw"))
+    with runlog.run(out, kind="hub-profile", title=f"AI Hub profile of {args.model}",
+                    model={"name": str(args.model), "weights": "your model (file or AI Hub model id)"},
+                    settings=[runlog.setting("profile options", args.options or "(none)", "(none)", group="deployment")],
+                    device=args.device, runtime="as compiled") as rl:
+        model: Any = args.model if Path(args.model).exists() else hc.get_model(args.model)
+        job = hc.submit_inference(model, hc.device(args.device), None, profile=True, name="hexprof profile",
+                                  options=args.options)
+        print(f"profile job {job.job_id}: {job.url}")
+        prof, _ = hc.save_profile(job, out, job.job_id)
+        m = aihub_metrics(prof)
+        print(metrics_markdown(f"{args.model} on {args.device}", m))
+        rl.result(inference_ms=m.get("inference_time_milliseconds"))
+        if args.hw:
+            print(hc.download_hw_artifacts(job, out / "hw"))
     return 0
 
 
@@ -501,9 +512,12 @@ def cmd_dummy_run(args: argparse.Namespace) -> int:
     dims = DS.parse_dims(args.dims)
     out = args.out or str(Path(os.environ.get("HEXPROF_DOWNLOAD_DIR") or ".") / "dummy" / (
         args.target + "__" + ("_".join(f"{k}{v}" for k, v in sorted(dims.items())) or "full")))
+    from hexprof.study.run import default_ceilings
+
+    dc, db = default_ceilings()  # the measured ceilings (slurm/ceilings.sh) when they exist
     ver = DR.run(args.target, dims, _dummy_deploy(args), out, args.device, base=args.base_config, seed=args.seed,
                  qairt=args.qairt, hw=not args.no_hw, report=not args.no_report, n_calib=args.calibration_samples,
-                 compute_json=args.compute_json, bandwidth_json=args.bandwidth_json)
+                 compute_json=args.compute_json or dc, bandwidth_json=args.bandwidth_json or db)
     print(f"results: {out}")
     return 0 if ver.get("ok") else 1
 
@@ -634,6 +648,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--export-dir", help="where the one-time compile/profile results live "
                                         "(default: <download-dir>/gemma4-s25-export or runs/gemma4-s25-export)")
     p.add_argument("--export-only", action="store_true", help="only run the one-time compile + profile step")
+    p.add_argument("--context-length", type=int, help="KV-cache length of the compiled graphs (Qualcomm: 4096); "
+                                                      "export goes to <download-dir>/gemma4-s25-export-cl<N>")
+    p.add_argument("--prompt-length", type=int, help="tokens per prefill graph (Qualcomm: 128)")
     p.add_argument("--force-export", action="store_true", help="redo the compile + profile step")
     p.add_argument("--checkpoint", default="DEFAULT", help="DEFAULT = Qualcomm's published w4a16 checkpoint, "
                                                            "or a quantized checkpoint dir from `pipeline gemma4 quantize`")

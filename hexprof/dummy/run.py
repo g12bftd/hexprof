@@ -43,6 +43,38 @@ def describe(r: S.Resolved, src: str) -> str:
     return "\n".join(lines)
 
 
+NAMES = {"gemma4-text": "Gemma 4 E4B text decoder", "gemma4-vision": "Gemma 4 E4B vision encoder",
+         "siglip2-image": "SigLIP 2 image encoder", "siglip2-text": "SigLIP 2 text encoder"}
+QUALCOMM_CODE = {"gemma4-text": "Qualcomm's Gemma4_E4B_PreSplit / PartBase (export + split), subclassed with these sizes",
+                 "gemma4-vision": "Qualcomm's gemma_4_e4b_it VisionEncoder.from_pretrained",
+                 "siglip2-image": "Qualcomm's SigLIP2ImageEncoder.from_pretrained",
+                 "siglip2-text": "Qualcomm's SigLIP2TextEncoder.from_pretrained"}
+
+
+def run_manifest(r: S.Resolved, src: str, seed: int) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """(model, settings against the real model / Qualcomm, other facts) for the run log of a dummy."""
+    from hexprof import runlog as RL
+
+    t = r.target
+    st = [RL.setting(k, r.dims.get(k), r.real.get(k), group="architecture") for k in S.knobs(t) if k in r.dims]
+    for k, v in r.deploy.items():
+        if k in ("image_size", "seq_len", "soft_tokens"):  # the same value as a knob listed above
+            continue
+        base = S.DEPLOY[t].get(k)
+        if k == "splits" and r.real:
+            base = S.default_splits(r.real["layers"], r.real.get("kv-shared-layers", 0))
+        st.append(RL.setting(k.replace("_", " "), v, base, group="deployment"))
+    if t == "gemma4-text":
+        st.append(RL.setting("quantization", "AI Hub quantize job (one weight dtype, random calibration data)",
+                             "AIMET recipe (int4 + int8 down_proj / lm_head)", group="deployment",
+                             note="Qualcomm's AIMET calibration needs an x86 GPU"))
+    model = {"name": f"{NAMES[t]} (SHRUNK DUMMY)", "weights": f"random dummy weights (seed {seed})",
+             "source": f"{QUALCOMM_CODE[t]}; base config {src}",
+             "architecture": {k: v for k, v in r.dims.items()}}
+    extra = {"notes": r.notes, "warnings": r.warnings} if (r.notes or r.warnings) else {}
+    return model, st, extra
+
+
 def component_fixed(r: S.Resolved, ckpt: Path, qairt: str | None, n_calib: int | None) -> dict[str, Any]:
     """The settings the component runner (hexprof.study.components) needs for this dummy."""
     from hexprof.dummy import checkpoint as C
@@ -75,25 +107,39 @@ def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Pa
     if r.errors:
         raise ValueError("; ".join(r.errors))
     ckpt = out / "checkpoint"
-    info = C.make(r, ckpt, seed=seed, base_source=src)
-    write_json(out / "dummy_run.json", {"target": target, "resolved": r.to_json(), "base_config": src, "seed": seed,
-                                        "checkpoint": str(ckpt), "parameters": info.get("parameters"),
-                                        "qairt": qairt, "device": device, "expected": S.expected_io(r),
-                                        "param_estimate": S.param_estimate(r)})
-    if target == "gemma4-text":
-        from hexprof.dummy import gemma4_text as G
+    from hexprof import runlog
 
-        parts = G.export(r, ckpt, out, qairt)
-        G.Deploy(out, parts["parts"], str(r.deploy["precision"]), device, n_calib or 8, hw).run()
-        ver = G.verify(out, device)
-    else:
-        from hexprof.study import components as SC
+    model, settings, extra = run_manifest(r, src, seed)
+    with runlog.run(out, kind="dummy", title=f"{NAMES[target]}: shrunk dummy on AI Hub", model=model,
+                    settings=settings, device=device, qairt=qairt,
+                    runtime="QNN context binary (compile to qnn_dlc, link" + (" prompt + token graphs per part)"
+                                                                             if target == "gemma4-text" else ")"),
+                    extra=extra) as rl:
+        info = C.make(r, ckpt, seed=seed, base_source=src)
+        rl.add(model={"parameters": f"{info.get('parameters', 0) / 1e6:.1f} M in the checkpoint"})
+        write_json(out / "dummy_run.json", {"target": target, "resolved": r.to_json(), "base_config": src, "seed": seed,
+                                            "checkpoint": str(ckpt), "parameters": info.get("parameters"),
+                                            "qairt": qairt, "device": device, "expected": S.expected_io(r),
+                                            "param_estimate": S.param_estimate(r)})
+        if target == "gemma4-text":
+            from hexprof.dummy import gemma4_text as G
+            from hexprof.pipeline.gemma4_export import latency_results
 
-        fixed = component_fixed(r, ckpt, qairt, n_calib)
-        SC.run_one(target, "dummy", "-", out, fixed, device)
-        ver = verify_component(out, device)
-    write_json(out / "verification.json", ver)
-    _print_verification(ver)
+            parts = G.export(r, ckpt, out, qairt)
+            summary = G.Deploy(out, parts["parts"], str(r.deploy["precision"]), device, n_calib or 8, hw).run()
+            rl.result(**latency_results(summary))
+            ver = G.verify(out, device)
+        else:
+            from hexprof.study import components as SC
+
+            fixed = component_fixed(r, ckpt, qairt, n_calib)
+            SC.run_one(target, "dummy", "-", out, fixed, device)
+            ver = verify_component(out, device)
+        write_json(out / "verification.json", ver)
+        _print_verification(ver)
+        bad = [c["what"] for c in ver.get("checks", []) if not c["ok"]]
+        rl.result(verification=("VERIFIED" if ver.get("ok") else "NOT VERIFIED") + f" ({len(ver.get('checks', []))} checks"
+                  + (f"; failed: {'; '.join(bad[:5])}" if bad else "") + ")")
     if report:
         from hexprof.hwreport import report as R
 

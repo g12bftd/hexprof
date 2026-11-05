@@ -173,7 +173,12 @@ def test_dummy_text_run_verifies_and_reports(tmp_path, monkeypatch, faked):
     assert kinds.count("inference") == 8
     summ = json.loads((tmp_path / "run" / "export_profiles.json").read_text())
     assert len(summ["parts"]) == 8 and "part1_of_4/prompt_ar64_cl1024_1_of_4" in summ["parts"]
-    assert (tmp_path / "run" / "hw_report" / "index.html").exists()
+    page = (tmp_path / "run" / "hw_report" / "index.html").read_text()
+    assert "What was deployed" in page and "SHRUNK DUMMY" in page  # from run_manifest.json
+    man = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
+    assert man["status"] == "succeeded" and man["results"]["verification"].startswith("VERIFIED")
+    changed = {x["setting"] for x in man["settings"] if x["changed"]}
+    assert {"hidden", "layers", "context length", "quantization"} <= changed
     what = {c["what"] for c in ver["checks"]}
     assert any("KV-cache inputs" in w for w in what) and any("logits" in w for w in what)
 

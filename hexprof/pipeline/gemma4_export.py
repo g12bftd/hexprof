@@ -138,10 +138,89 @@ def parse_export_args(checkpoint: str | Path, out_dir: str | Path, device_name: 
 
 def export(checkpoint: str | Path, out_dir: str | Path, device_name: str = "Samsung Galaxy S25",
            target_runtime: str = "geniex_qairt", precision: str = "w4a16", extra: Sequence[str] = (),
-           hw: bool = True) -> dict[str, Any]:
+           hw: bool = True, title: str | None = None, run_extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """Stage 2: compile + link + profile on AI Hub with the official recipe, then collect metrics."""
-    result = run_official_export(checkpoint, out_dir, device_name, target_runtime, precision, extra)
-    return collect(result, Path(out_dir), hw)
+    from hexprof import runlog
+
+    model, settings, info = manifest(checkpoint, out_dir, device_name, target_runtime, precision, extra)
+    with runlog.run(out_dir, kind="gemma4-export", title=title or "Gemma 4 E4B: Qualcomm export, profiled per graph",
+                    model=model, settings=settings, device=device_name, runtime=info["runtime"],
+                    extra={**info["extra"], **(run_extra or {})}) as run:
+        result = run_official_export(checkpoint, out_dir, device_name, target_runtime, precision, extra)
+        summary = collect(result, Path(out_dir), hw)
+        run.result(**latency_results(summary))
+        return summary
+
+
+QUALCOMM_DEFAULTS = {"checkpoint": "DEFAULT", "target_runtime": "geniex_qairt", "precision": "w4a16"}
+
+
+def manifest(checkpoint: str | Path, out_dir: str | Path, device_name: str, target_runtime: str, precision: str,
+             extra: Sequence[str]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """(model, settings against Qualcomm's defaults, other facts) for the run log of a Gemma 4 export.
+
+    The settings are what Qualcomm's own export parser reads from these arguments, next to what it reads
+    with no arguments (Qualcomm's defaults)."""
+    from hexprof import runlog as RL
+
+    try:
+        used = parse_export_args(checkpoint, out_dir, device_name, target_runtime, precision, extra)
+        base = parse_export_args("DEFAULT", out_dir, device_name, "geniex_qairt", "w4a16", [])
+    except Exception as e:  # noqa: BLE001 - the export itself will report it
+        used, base = {}, {}
+        print(f"(run log: could not parse the export arguments: {type(e).__name__}: {e})")
+    ckpt = str(checkpoint)
+    settings = [RL.setting("checkpoint", ckpt, "DEFAULT", group="weights",
+                           note="DEFAULT = Qualcomm's published AIMET w4a16 checkpoint")]
+    for k, note in (("context_lengths", "KV-cache length of every graph"),
+                    ("sequence_lengths", "tokens per call: prompt graph, then 1 = decode graph"),
+                    ("components", "parts exported (None = all: 4 text parts + vision encoder)"),
+                    ("precision", "None = from the checkpoint (w4a16)"), ("target_runtime", "")):
+        if k in used or k in base:
+            settings.append(RL.setting(k.replace("_", " "), used.get(k), base.get(k), group="export", note=note))
+    arch: dict[str, Any] = {}
+    try:
+        from qai_hub_models.models.gemma_4_e4b_it import model as E  # type: ignore[import-not-found]
+
+        arch = {"layers": E.NUM_LAYERS, "kv_shared_layers": E.NUM_KV_SHARED_LAYERS, "hidden": E.HIDDEN_SIZE,
+                "heads": E.NUM_ATTN_HEADS, "kv_heads": E.NUM_KEY_VALUE_HEADS, "head_dim": E.HEAD_DIM,
+                "global_head_dim": E.GLOBAL_HEAD_DIM, "sliding_window": E.SLIDING_WINDOW,
+                "split_points": E.SPLITTING_POINTS, "vision_image_size": E.VISION_DEFAULT_IMAGE_SIZE}
+    except Exception:  # noqa: BLE001
+        pass
+    weights = ("Qualcomm AI Hub published checkpoint gemma_4_e4b_it_w4a16 (AIMET-calibrated int4/int8 weights, "
+               "int16 activations)" if ckpt.upper().startswith("DEFAULT") else f"custom checkpoint {ckpt}")
+    try:
+        from importlib.metadata import version
+
+        source = f"qai-hub-models {version('qai-hub-models')} recipe {MODEL_ID}"
+    except Exception:  # noqa: BLE001
+        source = f"qai-hub-models recipe {MODEL_ID}"
+    model = {"name": "Gemma 4 E4B-it (google/gemma-4-E4B-it)", "weights": weights, "source": source,
+             "architecture": arch, "unchanged_architecture": "yes: Qualcomm's model code and dimensions"}
+    info = {"runtime": f"{target_runtime} (QNN context binaries: compile to qnn_dlc, link prompt + token graphs)",
+            "extra": {"export_flags": " ".join(map(str, extra)) or "(none)"}}
+    return model, settings, info
+
+
+def latency_results(summary: dict[str, Any]) -> dict[str, Any]:
+    """Headline numbers of an export for the run log: per-graph ms, decode / prefill totals."""
+    out: dict[str, Any] = {}
+    dec = pre = 0.0
+    for label, rec in (summary.get("parts") or {}).items():
+        ms = (rec.get("metrics") or {}).get("inference_time_milliseconds")
+        if ms is None:
+            continue
+        out[f"{label} ms"] = ms
+        if "token_ar1_" in label:
+            dec += ms
+        elif "prompt_ar" in label:
+            pre += ms
+    if dec:
+        out["decode step (sum of token graphs) ms"] = round(dec, 2)
+    if pre:
+        out["prompt chunk (sum of prompt graphs) ms"] = round(pre, 2)
+    return out
 
 
 def collect(result: Any, out_dir: Path, hw: bool = True) -> dict[str, Any]:

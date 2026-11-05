@@ -1,7 +1,9 @@
 #!/bin/bash -l
 # Gemma 4 E4B: compile for the Galaxy S25 NPU on AI Hub and profile every part (random inputs,
-# as AI Hub measures it). Results: $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/
+# as AI Hub measures it). Results: $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export/ (run_manifest.md: model,
+# settings vs Qualcomm's, hardware, every AI Hub job). Extra arguments go to `hexprof gemma4 aihub`:
 #   sbatch slurm/gemma4_profile.sh
+#   sbatch slurm/gemma4_profile.sh --context-length 2048     # -> gemma4-s25-export-cl2048/
 
 #SBATCH --job-name=gemma4_export
 #SBATCH --time=12:00:00
@@ -31,7 +33,7 @@ echo "HEXPROF_DOWNLOAD_DIR: ${HEXPROF_DOWNLOAD_DIR}"
 echo "hexprof commit:       $(git log -1 --oneline)"
 python -c "from importlib.metadata import version as v; print('qai-hub-models', v('qai-hub-models'), '| torch', v('torch'), '| transformers', v('transformers'))"
 
-srun -u hexprof gemma4 aihub --export-only
+srun -u hexprof gemma4 aihub --export-only "$@"
 status=$?
 
 echo "Finished on: $(date) (exit code ${status})"

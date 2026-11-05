@@ -46,13 +46,27 @@ shopt -u nullglob
 echo "Gemma 4 requests found: ${#GEMMA_REQ[@]}; SigLIP 2 requests found: ${#SIGLIP_REQ[@]}"
 
 status=0
-GEMMA=${HEXPROF_DOWNLOAD_DIR}/gemma4-s25-export
-if [ -d "$GEMMA" ]; then
+if [ $# -gt 0 ]; then  # explicit result folders, e.g. sbatch slurm/hw_report.sh $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export-cl2048
+  for d in "$@"; do
+    srun -u hexprof hw fetch-models "$d" --onnx "${HEXPROF_FETCH_ONNX:-vision}" \
+      || echo "fetch-models failed: the report continues without AI Hub model facts"
+    srun -u hexprof hw report "$d" --title "$(basename "$d") on Galaxy S25" "${CEIL[@]}" || status=$?
+  done
+  echo "Finished on: $(date) (exit code ${status})"
+  exit ${status}
+fi
+
+# Qualcomm's settings (gemma4-s25-export) and any changed context / prompt length (gemma4-s25-export-cl*)
+for GEMMA in "${HEXPROF_DOWNLOAD_DIR}"/gemma4-s25-export*/; do
+  [ -d "$GEMMA" ] || continue
+  GEMMA=${GEMMA%/}
+  REQ=()
+  [ "$(basename "$GEMMA")" = "gemma4-s25-export" ] && REQ=("${GEMMA_REQ[@]}")  # requests ran on Qualcomm's settings
   srun -u hexprof hw fetch-models "$GEMMA" --onnx "${HEXPROF_FETCH_ONNX:-vision}" \
     || echo "fetch-models failed: the report continues without AI Hub model facts"
-  srun -u hexprof hw report "$GEMMA" --title "Gemma 4 E4B on Galaxy S25" "${CEIL[@]}" \
-    ${GEMMA_REQ:+--requests "${GEMMA_REQ[@]}"} || status=$?
-fi
+  srun -u hexprof hw report "$GEMMA" --title "Gemma 4 E4B on Galaxy S25 ($(basename "$GEMMA"))" "${CEIL[@]}" \
+    ${REQ:+--requests "${REQ[@]}"} || status=$?
+done
 
 for d in "${HEXPROF_DOWNLOAD_DIR}"/runs/siglip2-profile-*/; do
   [ -d "$d" ] || continue

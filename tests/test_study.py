@@ -87,7 +87,7 @@ def _fake_gemma(monkeypatch, tmp_path, lie_about=None):
         ctx = [int(flags[flags.index("--context-lengths") + 1])]
         return {"sequence_lengths": seq, "context_lengths": ctx, "components": flags[flags.index("--components") + 1:]}
 
-    def export(checkpoint, out_dir, device, runtime, precision, flags, hw=True):
+    def export(checkpoint, out_dir, device, runtime, precision, flags, hw=True, **_kw):
         p = parse(checkpoint, out_dir, device, runtime, precision, flags)
         ctx = p["context_lengths"][0]
         real_ctx = 4096 if ctx == lie_about else ctx
