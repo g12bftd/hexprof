@@ -611,10 +611,13 @@ that what ran is what was asked:
   to the studies of the real models;
 * the job chain (uploaded part → quantized → compiled → linked → profiled), quantize dtypes, device, QAIRT;
 * for vision / SigLIP 2: the config Qualcomm's wrapper actually built, and the image-processor budget;
-* Gemma 4 vision only: the dummy's compile, link and profile options against your real export's
-  vision-encoder jobs on AI Hub (`$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export`, or `--reference`). They must be
-  identical: same QAIRT version, same flags, same graph name (`gemma_4_e4b_it_vision_encoder`, as Qualcomm's
-  collection export names it). The compiled input shapes must also match when the patch geometry is unchanged.
+* Gemma 4 vision only, when your real export exists (`$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export`, or
+  `--reference`): the dummy is compiled, linked and profiled with **the very options of your real export's
+  vision-encoder jobs** (read from AI Hub). The QAIRT version those jobs ran with is pinned explicitly,
+  because Qualcomm's code omits the flag when its pinned version is AI Hub's default at that moment.
+  Verification then requires the same options and the same QAIRT version for each of the three jobs, and the
+  same compiled input shapes when the patch geometry is unchanged. Without a real export, Qualcomm's own
+  option builders are used.
   Images are prepared by Gemma 4's own image processor (Google's preprocessor config, no tokenizer needed),
   or by transformers' class defaults if the Hub is unreachable (same shapes and patch positions).
 

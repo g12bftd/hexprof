@@ -41,23 +41,29 @@ BATCH_KW = {"siglip2-image": "image_batch_size", "siglip2-text": "text_batch_siz
 
 
 CKPT_KW = {"gemma4-vision": "checkpoint", "siglip2-image": "weights", "siglip2-text": "weights"}
-# Qualcomm's Gemma 4 collection names the vision encoder's graph "<collection>_<component>"
-QUALCOMM_GRAPH = {"gemma4-vision": "gemma_4_e4b_it_vision_encoder"}
+def use_reference_options(model: Any, ref: dict[str, Any]) -> str:
+    """Compile, link and profile the context binary with the options of a reference deployment's jobs
+    (hexprof.dummy.reference: your real export's vision encoder), QAIRT pinned to what those jobs ran with."""
+    from qai_hub_models import TargetRuntime  # type: ignore[import-not-found]
 
+    from hexprof.dummy import reference as REF
 
-def use_graph_name(model: Any, name: str) -> str:
-    """Make Qualcomm's option builders of this model use ``name`` for the context graph."""
-    oc, oi = model.get_hub_compile_options, model.get_hub_inference_options
+    oc, ol, oi = model.get_hub_compile_options, model.get_hub_link_options, model.get_hub_inference_options
+    cb = TargetRuntime.QNN_CONTEXT_BINARY
 
     def compile_options(rt: Any, prec: Any, other: str = "", device: Any = None, context_graph_name: Any = None) -> str:
-        return oc(rt, prec, other, device, context_graph_name or name)
+        return REF.pin(ref["compile"], ref.get("qairt")) if rt == cb else oc(rt, prec, other, device, context_graph_name)
+
+    def link_options(rt: Any, other: str = "") -> str:
+        return REF.pin(ref["link"], ref.get("qairt")) if rt == cb else ol(rt, other)
 
     def inference_options(rt: Any, other: str = "", context_graph_name: Any = None) -> str:
-        return oi(rt, other, context_graph_name or name)
+        return REF.pin(ref["profile"], ref.get("qairt")) if rt == cb else oi(rt, other, context_graph_name)
 
     model.get_hub_compile_options = compile_options
+    model.get_hub_link_options = link_options
     model.get_hub_inference_options = inference_options
-    return name
+    return f"reference jobs {ref.get('jobs')} (QAIRT {ref.get('qairt') or 'as recorded'})"
 
 
 def settings(target: str, axis: str, value: str, fixed: dict[str, Any]) -> dict[str, Any]:
@@ -176,8 +182,8 @@ def _run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, An
     with DC.processor_context(target, s) as proc_used:
         model = getattr(importlib.import_module(mod), cls_name).from_pretrained(**s["from_kwargs"])
     extra: dict[str, Any] = {"processor": dict(proc_used)} if proc_used else {}
-    if target in QUALCOMM_GRAPH:  # name the graph as Qualcomm's collection export does: identical options
-        extra["graph_name"] = use_graph_name(model, QUALCOMM_GRAPH[target])
+    if fixed.get("reference_options"):  # a dummy compared with your real export: the very same job options
+        extra["options_from"] = use_reference_options(model, fixed["reference_options"])
     if s.get("dummy"):
         if target == "gemma4-vision" and s.get("vision_hidden"):
             extra["pooler_padding_fixed"] = DC.fix_static_pooler(model, int(s["vision_hidden"]))

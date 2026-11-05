@@ -135,6 +135,11 @@ def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Pa
             from hexprof.study import components as SC
 
             fixed = component_fixed(r, ckpt, qairt, n_calib)
+            ro = reference_options(target, r, qairt, reference)
+            if ro:
+                fixed["reference_options"] = ro
+                rl.add(extra={"job options": f"copied from your real export's jobs {ro['jobs']} "
+                                             f"(QAIRT {ro.get('qairt')} pinned)"})
             SC.run_one(target, "dummy", "-", out, fixed, device)
             ver = verify_component(out, device, reference)
         write_json(out / "verification.json", ver)
@@ -174,6 +179,26 @@ def _same(a: list[int] | None, b: list[int] | None) -> bool:
 
 
 R_COMPONENT = {"gemma4-vision": "vision_encoder"}  # components with a Qualcomm export to compare against
+
+
+def reference_options(target: str, r: S.Resolved, qairt: str | None, reference: str | None) -> dict[str, Any] | None:
+    """The real export's job options to deploy this dummy with (None: Qualcomm's option builders are used)."""
+    if target not in R_COMPONENT or qairt or r.deploy.get("precision") != S.DEPLOY[target]["precision"]:
+        return None
+    from hexprof.dummy import reference as REF
+
+    ref_dir = reference or REF.default_reference()
+    if ref_dir is None:
+        print("    no real export to copy job options from: Qualcomm's option builders are used")
+        return None
+    try:
+        ro = REF.reference_options(ref_dir, R_COMPONENT[target])
+    except Exception as e:  # noqa: BLE001 - e.g. no AI Hub access to the reference jobs
+        print(f"    could not read the reference jobs in {ref_dir}: {type(e).__name__}: {e}")
+        return None
+    if ro:
+        print(f"    job options copied from your real export ({ref_dir}): compile '{ro['compile']}', QAIRT {ro['qairt']}")
+    return ro
 
 
 def verify_component(out: Path, device: str, reference: str | Path | None = None) -> dict[str, Any]:

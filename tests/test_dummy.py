@@ -271,3 +271,13 @@ def test_reference_comparison_needs_identical_options(tmp_path, monkeypatch):
     bad: list = []
     REF.compare(bad, chain("compile"), ref, tmp_path, same_inputs=True)
     assert [c["what"].split(" =")[0] for c in bad if not c["ok"]] == ["compile options"]
+
+
+def test_reference_options_ignore_how_qairt_was_requested():
+    from hexprof.dummy import reference as REF
+
+    real = "--target_runtime qnn_dlc  --output_names vision_embedding --qnn_options context_enable_graphs=gemma_4_e4b_it"
+    pinned = REF.pin(real, "2.50")
+    assert pinned.endswith("--qairt_version 2.50") and "  " not in pinned
+    assert REF._norm(pinned) == REF._norm(real)  # the version is compared per job, as it actually ran
+    assert REF.pin(pinned, "2.51") == pinned and REF._api("2.50.0.250924") == "2.50"

@@ -3,13 +3,15 @@
 The reference is your Qualcomm export (``hexprof gemma4 aihub --export-only``, default
 ``$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export``). For the component it holds (the Gemma 4 vision encoder),
 the profile job recorded in ``export_profiles.json`` is followed back to its link and compile jobs on
-AI Hub, and their options are compared with the dummy's own jobs. With the dummy's precision and QAIRT
-left at Qualcomm's settings, the options must be identical: then the only differences between the two
-deployments are the model's dimensions and its (random) weights.
+AI Hub. A dummy of that component (same precision, QAIRT left alone) is compiled, linked and profiled
+with exactly those jobs' options, with the QAIRT version they ran with pinned explicitly, and the
+verification checks it: same options, same QAIRT version for every job. The only differences between
+the two deployments are then the model's dimensions and its (random) weights.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -46,13 +48,45 @@ def reference_jobs(export_dir: str | Path, component: str) -> dict[str, Any] | N
     return out
 
 
+_QAIRT = re.compile(r"--qairt_version\s+\S+")
+
+
 def _norm(opts: Any) -> str:
-    return " ".join(str(opts or "").split())
+    """Options without the QAIRT flag (compared separately, as the version each job actually ran with:
+    Qualcomm's code leaves the flag out when its pinned version is AI Hub's default at that moment)."""
+    return " ".join(_QAIRT.sub("", str(opts or "")).split())
+
+
+def _api(version: str | None) -> str | None:
+    """'2.50.0.250924' -> '2.50'."""
+    m = re.match(r"(\d+)\.(\d+)", str(version or ""))
+    return f"{m.group(1)}.{m.group(2)}" if m else None
+
+
+def pin(opts: str, api: str | None) -> str:
+    """The options with an explicit ``--qairt_version`` (the reference's), so AI Hub's default moving on
+    since the reference ran cannot change the version."""
+    opts = " ".join(str(opts or "").split())
+    return opts if (not api or "--qairt_version" in opts) else f"{opts} --qairt_version {api}"
+
+
+def reference_options(export_dir: str | Path, component: str) -> dict[str, Any] | None:
+    """The reference jobs' options and the QAIRT version they ran with, to reuse for a dummy."""
+    from hexprof.aihub import client as hc
+
+    ref = reference_jobs(export_dir, component)
+    if not ref or not all(ref.get(k) is not None for k in ("compile", "link", "profile")):
+        return None
+    q = hc.qairt_version(ref["compile"]) or hc.qairt_version(ref["profile"])
+    return {"compile": str(ref["compile"].options or ""), "link": str(ref["link"].options or ""),
+            "profile": str(ref["profile"].options or ""), "qairt": _api(q), "qairt_full": q,
+            "jobs": {k: ref[k].job_id for k in ("compile", "link", "profile")}, "export_dir": str(export_dir)}
 
 
 def compare(checks: list[dict[str, Any]], mine: dict[str, Any], ref: dict[str, Any], export_dir: str | Path,
             same_inputs: bool) -> None:
-    """Add checks: each job's options equal the reference's; the compiled input shapes too when expected."""
+    """Add checks: each job's options and QAIRT version equal the reference's; the compiled input shapes too."""
+    from hexprof.aihub import client as hc
     from hexprof.study import core
 
     for kind in ("compile", "link", "profile"):
@@ -63,12 +97,10 @@ def compare(checks: list[dict[str, Any]], mine: dict[str, Any], ref: dict[str, A
             continue
         oa, ob = _norm(getattr(a, "options", "")), _norm(getattr(b, "options", ""))
         core.check(checks, f"{kind} options = Qualcomm's export (job {b.job_id})", ob, oa, oa == ob,
-                   "identical options: only the model (dimensions, random weights) differs")
+                   "identical options (QAIRT compared below): only the model (dimensions, random weights) differs")
+        qa, qb = hc.qairt_version(a), hc.qairt_version(b)
+        if qa or qb:
+            core.check(checks, f"{kind} job QAIRT version = Qualcomm's export", qb, qa, qa == qb)
     if same_inputs and mine.get("compile") is not None and ref.get("compile") is not None:
         sa, sb = core.shapes_of(getattr(mine["compile"], "shapes", None)), core.shapes_of(getattr(ref["compile"], "shapes", None))
         core.check(checks, "compiled input shapes = Qualcomm's export", sb, sa, bool(sa) and sa == sb)
-    from hexprof.aihub import client as hc
-
-    qa, qb = hc.qairt_version(mine["profile"]), hc.qairt_version(ref["profile"]) if ref.get("profile") else None
-    if qa and qb:
-        core.check(checks, "QAIRT version = Qualcomm's export", qb, qa, qa == qb)
