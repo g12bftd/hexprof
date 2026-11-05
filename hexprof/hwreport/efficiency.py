@@ -85,7 +85,7 @@ def graph_metrics(label: str, kpis: dict[str, Any], instances: dict[str, Any], q
             out["warnings"] += counted["warnings"]
         except Exception as e:  # noqa: BLE001 - fall back to analytic
             out["warnings"].append(f"ONNX MAC count failed for {onnx_path}: {type(e).__name__}: {e}")
-    ana = analytic.gemma4_text(label, ctx.gemma_config) or analytic.siglip2(label, precision)
+    ana = analytic.gemma4_text(label, ctx.gemma_config) or analytic.siglip2(label, precision, ctx.gemma_config)
     if counted and counted["total_macs"]:
         out.update(macs=counted["total_macs"], macs_source=f"ONNX shapes ({Path(onnx_path).name}): every MatMul / Conv "
                    f"as compiled", weight_macs=counted["weight_macs"], activation_macs=counted["activation_macs"])

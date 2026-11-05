@@ -45,13 +45,26 @@ def gemma4_text(label: str, config_path: str | Path | None = None) -> dict[str, 
     cnt = ge.part_counts(c, part, nparts, seq, ctx)
     return {"macs": cnt["ops"] / 2, "weight_bytes": cnt["weight_bytes"], "kv_bytes": cnt["kv_bytes"],
             "weight_params": cnt["params"], "layers": cnt["layers"], "tokens": seq, "context": ctx,
-            "precision": "w4a16",
-            "source": "analytic: Gemma 4 config + Qualcomm's w4a16 recipe (useful MACs; attention over the "
-                      "sliding window / filled context)"}
+            "precision": f"w{c.uniform_bits}a16" if c.uniform_bits and c.uniform_bits < 16 else
+                         ("fp16" if c.uniform_bits else "w4a16"),
+            "source": ("analytic: dummy config, uniform AI Hub quantization" if c.uniform_bits else
+                       "analytic: Gemma 4 config + Qualcomm's w4a16 recipe") +
+                      " (useful MACs; attention over the sliding window / filled context)"}
 
 
-def _siglip_config() -> dict[str, dict[str, int]]:
+def _siglip_config(config_path: str | Path | None = None) -> dict[str, dict[str, int]]:
     cfg = {k: dict(v) for k, v in SIGLIP2_BASE.items()}
+    if config_path and Path(config_path).is_file():  # e.g. a hexprof dummy checkpoint
+        try:
+            raw = json.loads(Path(config_path).read_text())
+        except (OSError, ValueError):
+            raw = {}
+        if "siglip" in str(raw.get("model_type", "")):
+            for side in ("vision", "text"):
+                for k, v in (raw.get(f"{side}_config") or {}).items():
+                    if k in cfg[side] and isinstance(v, int):
+                        cfg[side][k] = v
+            return cfg
     try:
         from huggingface_hub import try_to_load_from_cache
 
@@ -73,10 +86,10 @@ def _block(tokens: int, h: int, inter: int) -> tuple[float, float]:
     return tokens * params + 2 * tokens * tokens * h, params
 
 
-def siglip2(component: str, precision: str | None = "w8a16") -> dict[str, Any] | None:
+def siglip2(component: str, precision: str | None = "w8a16", config_path: str | Path | None = None) -> dict[str, Any] | None:
     if component not in ("image_encoder", "text_encoder"):
         return None
-    cfg = _siglip_config()
+    cfg = _siglip_config(config_path)
     bits = precision_bits(precision)
     if component == "image_encoder":
         v = cfg["vision"]

@@ -432,6 +432,7 @@ collects the metrics plus optrace/QHAS for each, and builds the GenieX QAIRT bun
 | `slurm/siglip2_profile.sh` | `hexprof siglip2 profile`: image and text encoders | `$HEXPROF_DOWNLOAD_DIR/runs/siglip2-profile-<jobid>/` |
 | `slurm/ceilings.sh` | `hexprof ceilings compute` (w8a16, w4a16, fp16) and `ceilings bandwidth` (w4a16); resumable | `$HEXPROF_DOWNLOAD_DIR/runs/ceil-compute/`, `runs/ceil-bandwidth/` |
 | `slurm/study.sh` | `hexprof study run …` with the arguments you pass (one sweep, verified and compared) | `$HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>/comparison/` |
+| `slurm/dummy.sh` | `hexprof dummy run …`: one shrunk random-weight model, deployed, profiled, verified | `$HEXPROF_DOWNLOAD_DIR/dummy/<target>__<knobs>/` |
 | `slurm/hw_report.sh` | `hexprof hw fetch-models` + `hexprof hw report` on both profiling results, with the ceilings when present | `…/hw_report/index.html` in each |
 
 ```bash
@@ -481,7 +482,7 @@ hexprof study list
 | `gemma4-text` | `context-length` | 512 1024 2048 4096 | `qai-hub-models export gemma_4_e4b_it --context-lengths V` (text parts only) |
 | `gemma4-text` | `prompt-length` | 64 128 256 512 | `--sequence-lengths V 1` |
 | `gemma4-text` | `decode-tokens` | 1 2 4 8 | `--sequence-lengths V`: cost of checking V drafted tokens at once (speculative decoding) |
-| `gemma4-vision` | `image-size` | 224 336 448 560 | Qualcomm's `VisionEncoder.from_pretrained(image_size=V)` |
+| `gemma4-vision` | `soft-tokens` | 70 140 280 560 1120 | the image processor's token budget (`max_soft_tokens=V`) while Qualcomm's `VisionEncoder.from_pretrained` traces |
 | `gemma4-vision` | `precision` | float w8a16 | AI Hub quantize job on Qualcomm's float graph (Qualcomm ships float only) |
 | `siglip2-image` / `siglip2-text` | `batch` | 1 2 4 8 (16) | Qualcomm's `get_input_spec(image_batch_size / text_batch_size=V)` |
 | `siglip2-image` / `siglip2-text` | `precision` | float w8a16 w8a8 w4a16 | Qualcomm's quantize stage (`run_quantize`) |
@@ -489,6 +490,12 @@ hexprof study list
 | all single-graph targets | `mixed-precision` | 0 5 10 25 50 | Workbench Lite-MP: V% most sensitive layers at `--override` (fp16 / int16), the rest at the `--precision` base (w8a16 / w8a8); 0 = base only |
 
 Qualcomm's shipped setting is always among the defaults, so every study has its reference point.
+
+Why `soft-tokens` and not the image size for the Gemma 4 vision encoder: Gemma 4's image processor resizes
+every image (keeping its aspect ratio) to fill `soft_tokens × pooling_kernel²` patches and pads the rest, so
+any square input gives the same graph (448 px and 224 px both become 768 × 768 at 280 tokens). The token
+budget is what changes the work. An earlier `image-size` axis would have produced identical graphs; its
+"differs from every other value" check would have flagged that.
 
 ```bash
 sbatch slurm/study.sh gemma4-text --axis context-length --values 512 1024 2048 4096
@@ -501,7 +508,7 @@ hexprof study compare $HEXPROF_DOWNLOAD_DIR/studies/gemma4-text__context-length
 Results go to `$HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>/`: one folder per value (jobs, profiles, QHAS
 / optrace, `verification.json`, `hw_report/`) and `comparison/index.html` with every metric against the value,
 plus CSV / JSON. Settings that are not swept are flags too (`--context-length`, `--prompt-length`,
-`--precision`, `--qairt`, `--batch`, `--image-size`). They are recorded in `study.json`, and a study folder
+`--precision`, `--qairt`, `--batch`, `--soft-tokens`). They are recorded in `study.json`, and a study folder
 refuses to mix runs with different fixed settings. Re-running resumes; `hexprof study verify <dir>` re-checks
 against AI Hub.
 
@@ -524,6 +531,77 @@ What the studies do not establish:
   when that is unavailable; quality must be evaluated separately;
 * whether GenieX on a phone accepts a changed graph. AI Hub runs each graph on the S25 on its own.
 
+## Shrunk models with random weights (`hexprof dummy`)
+
+Deploy a smaller Gemma 4 (text or vision) or SigLIP 2 (image or text encoder) on the S25 NPU with full
+hardware profiling, choosing its sizes: layers, hidden size, MLP width, heads, KV heads, head dims, sliding
+window, KV-shared layers, vocabulary, patch size, image-token budget, sequence lengths, context, batch,
+precision. Weights are random. Shapes, sizes and operator structure are what matter, not accuracy. No
+custom NPU kernels are involved. The models are built by **Qualcomm's own model code** from a Hugging Face
+config with the requested sizes, so they get the same NPU adaptations as the published deployments:
+
+| Target | Built with | What the device runs |
+|---|---|---|
+| `gemma4-text` | Qualcomm's `Gemma4_E4B_PreSplit` / `Gemma4_E4B_PartBase`, subclassed with the requested sizes; their CPU-only ONNX export and split (no AIMET, no GPU) | the same part / graph layout as Qualcomm's export: `part1_of_N` … lm_head part, each a context binary with a `prompt_ar{P}_cl{C}` and a `token_ar1_cl{C}` graph; single-head Conv attention, external embeddings + per-layer inputs, per-head KV-cache I/O, separate sliding-window / global masks and RoPE, KV sharing |
+| `gemma4-vision` | Qualcomm's `VisionEncoder.from_pretrained(checkpoint=…)` | Qualcomm's adapted vision tower (attention / RMSNorm / Linear→Conv rewrites, static pooler) |
+| `siglip2-image`, `siglip2-text` | Qualcomm's `SigLIP2ImageEncoder` / `SigLIP2TextEncoder.from_pretrained(weights=…)` | Qualcomm's encoder graphs |
+
+```bash
+hexprof dummy knobs
+```
+
+```bash
+hexprof dummy plan gemma4-text --dims layers=12 hidden=1280 intermediate=5120 heads=4 kv-heads=1
+```
+
+```bash
+sbatch slurm/dummy.sh gemma4-text --dims layers=12 hidden=1280 intermediate=5120 heads=4 kv-heads=1
+```
+
+`plan` needs neither torch nor AI Hub. It prints the real and the requested value of every knob, the
+parts and graphs, the KV-cache tensors and the estimated weights, and it rejects layouts Qualcomm's code
+cannot build. Examples: heads that are not a multiple of the KV heads, or KV-shared layers that have no
+earlier layer of their attention type to read from. It warns when a size is not a multiple of 32 (the HMX
+pads it). Knobs you do not give keep the real model's values, read from its `config.json` (Gemma 4: the copy
+Qualcomm's export cached under `~/.qaihm`, else Hugging Face; or `--base-config`). When only `layers`
+changes, the KV-shared fraction (18 of 42) and the split points scale with it.
+
+`run` writes a random checkpoint, runs Qualcomm's export (Gemma text) or Qualcomm's wrapper (vision,
+SigLIP 2), and then on AI Hub: upload → quantize job (random calibration data) → compile per graph
+(`qnn_dlc`, Qualcomm's own compile options) → link → profile per graph with QHAS / optrace. It then checks
+that what ran is what was asked:
+* every input of every compiled graph against shapes computed from the knobs alone: hidden, per-layer
+  inputs (= total layers × per-layer width), masks (context, sliding window), RoPE widths (head dims), one
+  KV tensor per non-shared layer and KV head, and logits (= vocabulary);
+* the layers inside each exported part;
+* the job chain (uploaded part → quantized → compiled → linked → profiled), quantize dtypes, device, QAIRT;
+* for vision / SigLIP 2: the config Qualcomm's wrapper actually built, and the image-processor budget.
+
+Finally the hardware report is built (per-op MACs from the local ONNX parts). Sweep one knob with
+verification and a comparison page:
+
+```bash
+sbatch slurm/study.sh dummy-gemma4-text --axis layers --values 6 12 24 42 --dims hidden=1280 intermediate=5120
+```
+
+Be aware of what a dummy is and is not:
+* **Fidelity check first.** `hexprof dummy run gemma4-text` with no `--dims` builds the full-size model
+  through the same path. Its per-graph latency and QHAS numbers against Qualcomm's real export
+  (`slurm/gemma4_profile.sh`) show how far the dummy path itself is off before you trust shrunk variants.
+* **Quantization differs.** Qualcomm's Gemma text recipe (AIMET: int4, with int8 `down_proj` and lm_head and
+  per-channel blocks) needs an x86 GPU. Dummies use an AI Hub quantize job: one weight dtype for the whole
+  graph. w4a16 moves fewer weight bytes than Qualcomm's mix, and w8a16 more, so the two bracket it. Random
+  calibration data changes the scales, not the work.
+* **Random weights do not change the timing.** The HTP has no data-dependent sparsity or early exit in these
+  graphs.
+* Sizes that are not multiples of 32 compile but run padded. That is part of what you measure, but the
+  real models are aligned.
+* AI Hub runs each graph on its own. A dummy is not a GenieX bundle; no tokenizer or embedding tables are
+  shipped.
+* Qualcomm's vision pooler hard-codes width 768 for its padding tensor. For other widths hexprof rebuilds
+  that tensor at the encoder's width (the real model is unaffected). Gemma 4 dummies drop the audio tower,
+  and SigLIP 2 dummies shrink the unused tower; neither reaches the NPU.
+
 ## Tests
 
 ```bash
@@ -538,7 +616,13 @@ The tests run without a phone or an AI Hub token. They cover:
 * the fits;
 * optrace/QHAS parsing and the HTML report, on synthetic files with Qualcomm's schema;
 * end-to-end Gemma 4 flows against a simulated phone, plus the real adb wrapper through a POSIX shell;
-* SigLIP 2 and sweep flows against a simulated AI Hub.
+* SigLIP 2 and sweep flows against a simulated AI Hub;
+* shrunk models (`hexprof dummy`): knob resolution and validation, the full-size request reproducing
+  Qualcomm's layout, and the deploy → verify chain against a simulated AI Hub. That chain includes a
+  compiler that changes a shape (caught) and the fallback to per-graph quantization. During development the
+  real path ran on CPU: a random 8-layer Gemma 4 through Qualcomm's own export and split, and every part in
+  ONNX Runtime at both graph shapes. SigLIP 2 and Gemma 4 vision dummies were also loaded and traced through
+  Qualcomm's wrappers.
 
 ## Troubleshooting
 

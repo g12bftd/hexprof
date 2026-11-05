@@ -10,10 +10,12 @@ from hexprof.study import core
 
 
 def _runners(target: str) -> tuple[Any, Any]:
-    if target == "gemma4-text":
-        from hexprof.study import gemma4_text as m
+    if target.startswith("dummy-"):
+        from hexprof.dummy import study as m
+    elif target == "gemma4-text":
+        from hexprof.study import gemma4_text as m  # type: ignore[no-redef]
     else:
-        from hexprof.study import components as m
+        from hexprof.study import components as m  # type: ignore[no-redef]
     return m.run_one, m.verify
 
 
@@ -27,6 +29,11 @@ def run(target: str, axis: str, values: Sequence[str], fixed: dict[str, Any], ou
         device: str = core.DEFAULT_DEVICE, force: bool = False, compare: bool = True,
         compute_json: str | None = None, bandwidth_json: str | None = None) -> Path:
     study = core.Study.open(target, axis, values, fixed, out, device)
+    if target.startswith("dummy-") and "baseline" not in study.state:
+        from hexprof.dummy import study as DS
+
+        study.state["baseline"] = DS.baseline(target, axis, fixed)
+        study.save()
     one, verify = _runners(target)
     print(f"Study {target} / {axis}: values {study.values}; fixed {fixed}; device {device}; results in {study.out}")
     if target == "gemma4-text":

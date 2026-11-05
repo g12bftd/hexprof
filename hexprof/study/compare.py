@@ -19,7 +19,15 @@ GRAPH = re.compile(r"part_?(\d+)_of_(\d+)__(prompt|token)_ar(\d+)_cl(\d+)")
 AXIS_LABEL = {"context-length": "context length (tokens)", "prompt-length": "prompt chunk (tokens)",
               "decode-tokens": "tokens per decode step", "image-size": "image size (px)", "batch": "batch size",
               "precision": "precision", "qairt": "QAIRT version",
-              "mixed-precision": "% of layers kept at higher precision"}
+              "mixed-precision": "% of layers kept at higher precision",
+              "soft-tokens": "image token budget (soft tokens)",
+              # hexprof dummy knobs
+              "layers": "layers", "hidden": "hidden size", "intermediate": "MLP width", "heads": "attention heads",
+              "kv-heads": "KV heads", "head-dim": "head dim (sliding)", "global-head-dim": "head dim (global)",
+              "sliding-window": "sliding window (tokens)", "kv-shared-layers": "KV-shared layers",
+              "ple-dim": "per-layer-embedding width", "vocab": "vocabulary", "patch-size": "patch size (px)",
+              "pooling-kernel": "pooling kernel", "text-hidden": "image-token width", "seq-len": "text tokens",
+              "projection": "embedding width"}
 
 
 def _n(v: Any) -> float | None:
@@ -132,17 +140,24 @@ def compare(study_dir: str | Path, compute_json: str | None = None, bandwidth_js
         if v.get("status") == "profiled":
             rdir = vdir / "hw_report"
             if rebuild or not (rdir / "summary.json").exists():
+                cfg = vdir / "checkpoint" / "config.json"  # hexprof dummy: the shrunk model's own config
                 try:
                     report.build([vdir], rdir, top=top, compute_json=compute_json, bandwidth_json=bandwidth_json,
-                                 title=f"{target}: {axis} = {value}")
+                                 title=f"{target}: {axis} = {value}",
+                                 gemma_config=str(cfg) if cfg.exists() else None)
                 except FileNotFoundError as e:
                     row["error"] = str(e)
             if (rdir / "summary.json").exists():
                 summ = read_json(rdir / "summary.json")
                 row["report"] = ("../" + (rdir / "index.html").relative_to(sdir).as_posix()  # page lives in <study>/comparison/
                                  if rdir.is_relative_to(sdir) else (rdir / "index.html").as_uri())
-                if target == "gemma4-text":
+                if core.kind(target) == "gemma4-text":
                     row["metrics"] = gemma_text_metrics(summ, axis, value)
+                elif target.startswith("dummy-"):
+                    from hexprof.dummy.study import component_and_batch
+
+                    comp, b = component_and_batch(target, axis, value, st.get("fixed") or {})
+                    row["metrics"] = component_metrics(summ, comp, b)
                 else:
                     from hexprof.study.components import TARGETS, settings
 
@@ -170,10 +185,11 @@ def compare(study_dir: str | Path, compute_json: str | None = None, bandwidth_js
 def _page(st: dict[str, Any], variants: list[dict[str, Any]]) -> dict[str, Any]:
     target, axis = st["target"], st["axis"]
     numeric = axis in core.NUMERIC_AXES
-    key = f"{target}/{axis}" if f"{target}/{axis}" in METRICS else (target if target in METRICS else "component")
+    t = core.kind(target) if target.startswith("dummy-") else target
+    key = f"{t}/{axis}" if f"{t}/{axis}" in METRICS else (t if t in METRICS else "component")
     mets = METRICS[key]
     good = [v for v in variants if v["verified"] and v["metrics"]]
-    base = core.BASELINE.get((target, axis))
+    base = core.baseline_of(st)
     tiles = []
     for mk, label, kind, higher in mets[:3]:
         pts = [(v["value"], v["metrics"].get(mk)) for v in good if v["metrics"].get(mk) is not None]

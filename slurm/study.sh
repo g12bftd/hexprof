@@ -3,8 +3,9 @@
 # export / model code, compiled and profiled on the device, verified (what ran = what was requested),
 # and compared. Arguments are passed to `hexprof study run` unchanged, e.g.
 #   sbatch slurm/study.sh gemma4-text --axis context-length --values 512 1024 2048 4096
-#   sbatch slurm/study.sh gemma4-vision --axis image-size --values 224 336 448 560
+#   sbatch slurm/study.sh gemma4-vision --axis soft-tokens --values 70 140 280 560 1120
 #   sbatch slurm/study.sh siglip2-text --axis batch --values 1 2 4 8 16
+#   sbatch slurm/study.sh dummy-gemma4-text --axis layers --values 6 12 24 42 --dims hidden=1280 intermediate=5120
 # Results: $HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>/comparison/index.html
 # Re-submitting the same command resumes: finished values are not rebuilt.
 

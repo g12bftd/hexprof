@@ -36,6 +36,8 @@ HEADLINE = {
 
 
 def _headline(target: str, axis: str) -> list[tuple[str, str, str, bool | None]]:
+    if target.startswith("dummy-"):
+        target = core.kind(target)
     return HEADLINE.get(f"{target}/{axis}") or HEADLINE.get(target) or HEADLINE["component"]
 
 
@@ -54,7 +56,7 @@ def summarize(studies_dir: str | Path | None = None) -> Path:
         data = read_json(cj)
         st = data["study"]
         target, axis = st["target"], st["axis"]
-        base_value = core.BASELINE.get((target, axis))
+        base_value = core.baseline_of(st)
         by = {v["value"]: v for v in data["variants"]}
         base = by.get(base_value)
         if not base or not base.get("verified"):
@@ -93,8 +95,9 @@ def _page(rows: list[dict[str, Any]], notes: list[str]) -> dict[str, Any]:
     sections: list[dict[str, Any]] = []
     groups: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
+        t = core.kind(r["target"]) if r["target"].startswith("dummy-") else r["target"]
         key = "gemma4-text/decode-tokens" if r["study"] == "gemma4-text / decode-tokens" else (
-            r["target"] if r["target"] in HEADLINE else "component")
+            t if t in HEADLINE else "component")
         groups.setdefault(key, []).append(r)
     for key, rs in groups.items():
         mets = HEADLINE[key]

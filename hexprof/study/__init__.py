@@ -8,7 +8,9 @@ the requested setting. Unverified variants are flagged and kept out of the compa
 
 Targets and axes
     gemma4-text    context-length | prompt-length | decode-tokens   (Qualcomm's export)
-    gemma4-vision  image-size | precision | qairt                   (Qualcomm's VEG class)
-    siglip2-image  batch | precision | qairt                        (Qualcomm's SigLIP 2)
-    siglip2-text   batch | precision | qairt
+    gemma4-vision  soft-tokens | precision | qairt | mixed-precision (Qualcomm's VEG class)
+    siglip2-image  batch | precision | qairt | mixed-precision      (Qualcomm's SigLIP 2)
+    siglip2-text   batch | precision | qairt | mixed-precision
+    dummy-*        any knob of a shrunk random-weight model (layers, hidden, heads, ...; see
+                   ``hexprof dummy knobs``), built by Qualcomm's own code (hexprof.dummy)
 """

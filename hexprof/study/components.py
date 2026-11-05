@@ -7,7 +7,9 @@ its stage functions: ``Model.from_pretrained(...)`` -> ``model.get_input_spec(..
 profile job on the device, the profile and the QHAS / optrace files.
 
 Axes
-    image-size  (gemma4-vision)  VisionEncoder.from_pretrained(image_size=V)
+    soft-tokens (gemma4-vision)  the image processor's token budget (70 / 140 / 280 / 560 / 1120): every
+                                 image is resized to fill V x pooling_kernel^2 patches, so this, not the
+                                 input image size, sets the graph (any square image gives the same graph)
     batch       (siglip2-*)      get_input_spec(image_batch_size=V / text_batch_size=V)
     precision   (all)            float | w8a16 | w8a8 | w4a16 ... via an AI Hub quantize job
     mixed-precision (all)        Workbench Lite-MP: V% most sensitive layers kept at --override
@@ -38,16 +40,28 @@ TARGETS = {
 BATCH_KW = {"siglip2-image": "image_batch_size", "siglip2-text": "text_batch_size"}
 
 
+CKPT_KW = {"gemma4-vision": "checkpoint", "siglip2-image": "weights", "siglip2-text": "weights"}
+
+
 def settings(target: str, axis: str, value: str, fixed: dict[str, Any]) -> dict[str, Any]:
     _, _, component, default_prec = TARGETS[target]
     s: dict[str, Any] = {"component": component, "precision": fixed.get("precision") or default_prec,
                          "qairt": fixed.get("qairt"), "from_kwargs": {}, "spec_kwargs": {}, "litemp": None}
-    if fixed.get("image_size") and target == "gemma4-vision":
-        s["from_kwargs"]["image_size"] = int(fixed["image_size"])
+    if fixed.get("soft_tokens") and target == "gemma4-vision":
+        s["soft_tokens"] = int(fixed["soft_tokens"])
     if fixed.get("batch") and target in BATCH_KW:
         s["spec_kwargs"][BATCH_KW[target]] = int(fixed["batch"])
-    if axis == "image-size":
-        s["from_kwargs"]["image_size"] = int(value)
+    if fixed.get("checkpoint_dir"):  # a shrunk random checkpoint (hexprof dummy)
+        s["dummy"] = True
+        s["from_kwargs"][CKPT_KW[target]] = str(fixed["checkpoint_dir"])
+        s["processor"] = fixed.get("processor") or {}
+        s["vision_hidden"] = fixed.get("vision_hidden")
+        if target == "siglip2-image" and fixed.get("image_size"):
+            s["spec_kwargs"].update(image_height=int(fixed["image_size"]), image_width=int(fixed["image_size"]))
+        if target == "siglip2-text" and fixed.get("seq_len"):
+            s["spec_kwargs"]["text_seq_len"] = int(fixed["seq_len"])
+    if axis == "soft-tokens":
+        s["soft_tokens"] = int(value)
     elif axis == "batch":
         s["spec_kwargs"][BATCH_KW[target]] = int(value)
     elif axis == "precision":
@@ -93,10 +107,19 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
     vdir.mkdir(parents=True, exist_ok=True)
     state_path = vdir / "jobs.json"
     state: dict[str, Any] = read_json(state_path) if state_path.exists() else {}
-    model = getattr(importlib.import_module(mod), cls_name).from_pretrained(**s["from_kwargs"])
+    from hexprof.dummy import components as DC
+
+    with DC.processor_context(target, s) as proc_used:
+        model = getattr(importlib.import_module(mod), cls_name).from_pretrained(**s["from_kwargs"])
+    extra: dict[str, Any] = {"processor": dict(proc_used)} if proc_used else {}
+    if s.get("dummy"):
+        if target == "gemma4-vision" and s.get("vision_hidden"):
+            extra["pooler_padding_fixed"] = DC.fix_static_pooler(model, int(s["vision_hidden"]))
+        extra["loaded_config"] = DC.loaded_config(model)
     spec = model.get_input_spec(**s["spec_kwargs"])
     write_json(vdir / "variant.json", {"target": target, "axis": axis, "value": value, "settings": s,
-                                       "local_input_spec": core.shapes_of(spec), "local_dtypes": core.dtypes_of(spec)})
+                                       "local_input_spec": core.shapes_of(spec), "local_dtypes": core.dtypes_of(spec),
+                                       **extra})
     prec = Precision.parse(s["precision"])
     dev = hc.device(device)
     name = f"hexprof_{target}_{axis}_{value}".replace(".", "_")
@@ -114,15 +137,21 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
             pct = s["litemp"]["percentage"]
             model.get_hub_litemp_percentage = lambda _p, _pct=pct: _pct
 
+        def sample_quantize() -> Any:
+            return hub.submit_quantize_job(model=onnx_model, calibration_data=model.sample_inputs(spec),
+                                           weights_dtype=prec.weights_type, activations_dtype=prec.activations_type,
+                                           name=name, options=model.get_hub_quantize_options(prec))
+
         def quantize() -> Any:
+            if s.get("dummy"):  # random weights: real data means nothing, and real token ids overflow a small vocabulary
+                state["calibration"] = "model sample inputs (random-weight dummy)"
+                return sample_quantize()
             try:
                 return run_quantize(prec, model, name, onnx_model, fixed.get("calibration_samples"), input_spec=spec)
             except Exception as e:  # noqa: BLE001 - no calibration dataset offline: the model's own sample inputs
                 print(f"    Qualcomm calibration data unavailable ({type(e).__name__}: {e}); using sample inputs")
                 state["calibration"] = "model sample inputs"
-                return hub.submit_quantize_job(model=onnx_model, calibration_data=model.sample_inputs(spec),
-                                               weights_dtype=prec.weights_type, activations_dtype=prec.activations_type,
-                                               name=name, options=model.get_hub_quantize_options(prec))
+                return sample_quantize()
 
         qjob = _staged(state, state_path, "quantize_job", quantize)
         source = hc.target_model(qjob)
@@ -186,10 +215,15 @@ def verify(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any]
         b = int(value)
         core.check(checks, "batch dimension", b, {k: d[0] for k, d in built.items()},
                    bool(built) and all(d and d[0] == b for d in built.values()))
-    if axis == "image-size":
+    if axis == "soft-tokens":
         sizes = {k: math.prod(d) for k, d in local.items()}
-        core.check(checks, "input elements traced for this image size", "differ from every other size",
+        core.check(checks, "input elements traced for this token budget", "differ from every other budget",
                    sizes, _unique_among_siblings(vdir, var))
+        pv = local.get("pixel_values") or []
+        proc = var.get("processor") or {}
+        k = int(proc.get("pooling_kernel_size") or 3)
+        core.check(checks, "image patches = soft tokens x pooling kernel^2", int(value) * k * k, pv[1] if len(pv) > 1 else None,
+                   len(pv) > 1 and pv[1] == int(value) * k * k)
     if s["precision"] == "float":
         core.check(checks, "precision float: no quantize job", None, jobs.get("quantize_job"), not jobs.get("quantize_job"))
     else:

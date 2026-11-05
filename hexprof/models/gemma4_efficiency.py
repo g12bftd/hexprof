@@ -78,6 +78,10 @@ class TextConfig:
     double_wide_mlp: bool
     ple_dim: int
     vocab: int
+    # hexprof dummy checkpoints (dummy.json next to config.json): their split points and AI Hub's
+    # uniform weight precision instead of Qualcomm's [24, 33] and int4 + int8 down_proj / lm_head
+    splits: tuple[int, ...] | None = None
+    uniform_bits: int | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "TextConfig":
@@ -101,6 +105,7 @@ class TextConfig:
             double_wide_mlp=bool(t.get("use_double_wide_mlp", False)),
             ple_dim=int(t.get("hidden_size_per_layer_input") or 0),
             vocab=int(t.get("vocab_size") or 262144),
+            **_dummy_overrides(Path(path).parent / "dummy.json"),
         )
 
     def is_global(self, i: int) -> bool:
@@ -109,6 +114,18 @@ class TextConfig:
     def is_kv_shared(self, i: int) -> bool:
         first = self.layers - self.kv_shared_layers
         return 0 < first <= i
+
+
+def _dummy_overrides(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        dep = (json.loads(path.read_text()).get("resolved") or {}).get("deploy") or {}
+    except (OSError, ValueError):
+        return {}
+    m = re.match(r"w(\d+)a", str(dep.get("precision") or ""))
+    return {"splits": tuple(int(x) for x in dep.get("splits") or ()) or None,
+            "uniform_bits": int(m.group(1)) if m else (16 if str(dep.get("precision")) in ("fp16", "float") else None)}
 
 
 # --------------------------------------------------------------------------- analytic counts
@@ -124,12 +141,13 @@ def layer_counts(c: TextConfig, i: int, seq: int, ctx: int, kv_bytes: float = 1.
     hd = c.global_head_dim if c.is_global(i) else c.head_dim
     span = ctx if c.is_global(i) else min(c.sliding_window, ctx)
     inter = c.intermediate[i] * (2 if c.double_wide_mlp and c.is_kv_shared(i) else 1)
-    mats = [(c.hidden, c.heads * hd, 4), (c.heads * hd, c.hidden, 4)]  # q, o
+    w4, w8 = (c.uniform_bits, c.uniform_bits) if c.uniform_bits else (4, 8)
+    mats = [(c.hidden, c.heads * hd, w4), (c.heads * hd, c.hidden, w4)]  # q, o
     if not c.is_kv_shared(i):
-        mats += [(c.hidden, c.kv_heads * hd, 4)] * 2  # k, v
-    mats += [(c.hidden, inter, 4), (c.hidden, inter, 4), (inter, c.hidden, 8)]  # gate, up (int4), down (int8)
+        mats += [(c.hidden, c.kv_heads * hd, w4)] * 2  # k, v
+    mats += [(c.hidden, inter, w4), (c.hidden, inter, w4), (inter, c.hidden, w8)]  # gate, up (int4), down (int8)
     if c.ple_dim:
-        mats += [(c.hidden, c.ple_dim, 4), (c.ple_dim, c.hidden, 4)]  # per-layer-embedding gate / projection
+        mats += [(c.hidden, c.ple_dim, w4), (c.ple_dim, c.hidden, w4)]  # per-layer-embedding gate / projection
     params = 0
     wbytes = 0.0
     for d_in, d_out, bits in mats:
@@ -143,7 +161,7 @@ def layer_counts(c: TextConfig, i: int, seq: int, ctx: int, kv_bytes: float = 1.
 
 def splits_for(c: TextConfig, num_parts: int, splits: tuple[int, ...] | None = None) -> tuple[int, ...]:
     """Layer split points for ``num_parts`` (last part = lm_head); Qualcomm's [24, 33] for Gemma 4 E4B."""
-    splits = tuple(splits) if splits is not None else SPLITTING_POINTS
+    splits = tuple(splits) if splits is not None else (c.splits or SPLITTING_POINTS)
     n_text = num_parts - 1
     if len(splits) == n_text - 1 and all(0 < s < c.layers for s in splits):
         return splits
@@ -154,7 +172,7 @@ def part_counts(c: TextConfig, part: int, num_parts: int, seq: int, ctx: int,
                 splits: tuple[int, ...] | None = None) -> dict[str, float]:
     bounds = [0, *splits_for(c, num_parts, splits), c.layers]
     if part == num_parts and len(bounds) - 1 < num_parts:  # last part = lm_head
-        p, b = _linear(c.hidden, c.vocab, LM_HEAD_BITS)
+        p, b = _linear(c.hidden, c.vocab, c.uniform_bits or LM_HEAD_BITS)
         return {"layers": "lm_head", "params": p, "weight_bytes": b, "ops": 2 * p * seq, "kv_bytes": 0.0}
     lo, hi = bounds[part - 1], bounds[part]
     tot = {"params": 0.0, "weight_bytes": 0.0, "ops": 0.0, "kv_bytes": 0.0}

@@ -387,14 +387,20 @@ def cmd_hw_fetch_models(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- studies
 
+DUMMY_TARGETS = {"dummy-gemma4-text", "dummy-gemma4-vision", "dummy-siglip2-image", "dummy-siglip2-text"}
+_COMPONENTS = {"gemma4-vision", "siglip2-image", "siglip2-text"}
 STUDY_FIXED = {  # fixed setting -> (targets it applies to, the axis it would conflict with)
-    "context_length": ({"gemma4-text"}, "context-length"), "prompt_length": ({"gemma4-text"}, "prompt-length"),
+    "context_length": ({"gemma4-text", "dummy-gemma4-text"}, "context-length"),
+    "prompt_length": ({"gemma4-text", "dummy-gemma4-text"}, "prompt-length"),
     "components": ({"gemma4-text"}, None), "checkpoint": ({"gemma4-text"}, None),
-    "target_runtime": ({"gemma4-text"}, None), "precision": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, "precision"),
-    "qairt": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, "qairt"),
-    "batch": ({"siglip2-image", "siglip2-text"}, "batch"), "image_size": ({"gemma4-vision"}, "image-size"),
-    "calibration_samples": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, None),
-    "override": ({"gemma4-vision", "siglip2-image", "siglip2-text"}, None),
+    "target_runtime": ({"gemma4-text"}, None), "precision": (_COMPONENTS | DUMMY_TARGETS, "precision"),
+    "qairt": (_COMPONENTS | DUMMY_TARGETS, "qairt"),
+    "batch": ({"siglip2-image", "siglip2-text", "dummy-siglip2-image", "dummy-siglip2-text"}, "batch"),
+    "soft_tokens": ({"gemma4-vision"}, "soft-tokens"),
+    "calibration_samples": (_COMPONENTS | DUMMY_TARGETS, None),
+    "override": (_COMPONENTS, None),
+    "dims": (DUMMY_TARGETS, None), "base_config": (DUMMY_TARGETS, None), "seed": (DUMMY_TARGETS, None),
+    "splits": ({"dummy-gemma4-text"}, None),
 }
 
 
@@ -408,6 +414,11 @@ def _study_fixed(args: argparse.Namespace) -> dict:
             raise SystemExit(f"--{key.replace('_', '-')} does not apply to {args.target}")
         if axis == args.axis:
             raise SystemExit(f"--{key.replace('_', '-')} is the swept axis; give its values with --values")
+        if key == "dims":
+            from hexprof.dummy import spec as DS
+
+            if args.axis in DS.parse_dims(val):
+                raise SystemExit(f"--dims sets {args.axis}, the swept axis; give its values with --values")
         fixed[key] = val
     return fixed
 
@@ -449,6 +460,58 @@ def cmd_study_list(args: argparse.Namespace) -> int:
 
     print(S.describe())
     return 0
+
+
+# --------------------------------------------------------------------------- shrunk models
+
+
+def _dummy_deploy(args: argparse.Namespace) -> dict:
+    return {"context_length": getattr(args, "context_length", None), "prompt_length": getattr(args, "prompt_length", None),
+            "precision": getattr(args, "precision", None), "batch": getattr(args, "batch", None),
+            "splits": getattr(args, "splits", None)}
+
+
+def cmd_dummy_knobs(args: argparse.Namespace) -> int:
+    from hexprof.dummy import spec as DS
+
+    for t in [args.target] if args.target else DS.TARGETS:
+        print(f"{t}  (deployment: " + ", ".join(f"--{k.replace('_', '-')} {v}" for k, v in DS.DEPLOY[t].items()
+                                               if v is not None and k != "splits") + ")")
+        for k, (sec, key) in DS.knobs(t).items():
+            print(f"  {k:<18} {sec + '.' if sec else ''}{key}")
+        print()
+    print("Unchanged knobs keep the real model's values (read from its config.json). "
+          "Check a request without running it: hexprof dummy plan <target> --dims knob=N ...")
+    return 0
+
+
+def cmd_dummy_plan(args: argparse.Namespace) -> int:
+    from hexprof.dummy import run as DR
+    from hexprof.dummy import spec as DS
+
+    r, src = DR.plan(args.target, DS.parse_dims(args.dims), _dummy_deploy(args), args.base_config)
+    print(DR.describe(r, src))
+    return 1 if r.errors else 0
+
+
+def cmd_dummy_run(args: argparse.Namespace) -> int:
+    from hexprof.dummy import run as DR
+    from hexprof.dummy import spec as DS
+
+    dims = DS.parse_dims(args.dims)
+    out = args.out or str(Path(os.environ.get("HEXPROF_DOWNLOAD_DIR") or ".") / "dummy" / (
+        args.target + "__" + ("_".join(f"{k}{v}" for k, v in sorted(dims.items())) or "full")))
+    ver = DR.run(args.target, dims, _dummy_deploy(args), out, args.device, base=args.base_config, seed=args.seed,
+                 qairt=args.qairt, hw=not args.no_hw, report=not args.no_report, n_calib=args.calibration_samples,
+                 compute_json=args.compute_json, bandwidth_json=args.bandwidth_json)
+    print(f"results: {out}")
+    return 0 if ver.get("ok") else 1
+
+
+def cmd_dummy_verify(args: argparse.Namespace) -> int:
+    from hexprof.dummy import run as DR
+
+    return 0 if DR.verify(args.run_dir, args.device).get("ok") else 1
 
 
 def cmd_hub_frameworks(args: argparse.Namespace) -> int:
@@ -738,7 +801,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = st.add_parser("list", help="targets, axes and default sweep values")
     p.set_defaults(func=cmd_study_list)
     p = st.add_parser("run", help="build, compile and profile every value on the device, verify, compare")
-    p.add_argument("target", choices=["gemma4-text", "gemma4-vision", "siglip2-image", "siglip2-text"])
+    p.add_argument("target", choices=["gemma4-text", "gemma4-vision", "siglip2-image", "siglip2-text",
+                                      *sorted(DUMMY_TARGETS)])
     p.add_argument("--axis", required=True, help="setting to sweep (see `hexprof study list`)")
     p.add_argument("--values", nargs="+", help="values to sweep (default: the list in `hexprof study list`)")
     p.add_argument("--out", help="study folder (default: $HEXPROF_DOWNLOAD_DIR/studies/<target>__<axis>); "
@@ -758,10 +822,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--precision", help="float, w8a16, w8a8, w4a16 (default: Qualcomm's: float vision, w8a16 SigLIP 2)")
     g.add_argument("--qairt", help="QAIRT version on AI Hub: default, latest or 2.xx (see `hexprof hub frameworks`)")
     g.add_argument("--batch", type=int, help="SigLIP 2 batch size when not swept")
-    g.add_argument("--image-size", type=int, help="vision encoder input size when not swept (Qualcomm: 448)")
+    g.add_argument("--soft-tokens", type=int, choices=[70, 140, 280, 560, 1120],
+                   help="Gemma 4 vision: image token budget when not swept (Qualcomm: 280)")
     g.add_argument("--calibration-samples", type=int, help="quantize-job calibration samples (default: Qualcomm's)")
     g.add_argument("--override", choices=["int16", "fp16"],
                    help="mixed-precision axis: dtype of the layers kept at higher precision (default fp16)")
+    g = p.add_argument_group("fixed settings, dummy-* (shrunk models with random weights; see `hexprof dummy knobs`)")
+    g.add_argument("--dims", nargs="+", metavar="KNOB=N", help="knobs not swept, e.g. hidden=1024 heads=4 (default: real)")
+    g.add_argument("--base-config", help="the real model's config.json (default: Qualcomm's cache, else Hugging Face)")
+    g.add_argument("--seed", type=int, help="random-weight seed (default 0)")
+    g.add_argument("--splits", nargs="+", type=int, help="dummy-gemma4-text: layer split points (default: Qualcomm's rule)")
     p.set_defaults(func=cmd_study_run)
     p = st.add_parser("verify", help="re-check every profiled value of a study against AI Hub")
     p.add_argument("study_dir")
@@ -775,6 +845,44 @@ def build_parser() -> argparse.ArgumentParser:
     p = st.add_parser("summary", help="ablation summary: every verified change against Qualcomm's setting")
     p.add_argument("studies_dir", nargs="?", help="default: $HEXPROF_DOWNLOAD_DIR/studies")
     p.set_defaults(func=cmd_study_summary)
+
+    # ---- shrunk models
+    dm = sub.add_parser("dummy", help="shrunk Gemma 4 / SigLIP 2 (random weights, Qualcomm's NPU adaptations) "
+                                      "deployed and profiled on AI Hub's S25").add_subparsers(dest="sub", required=True)
+    dummy_targets = ["gemma4-text", "gemma4-vision", "siglip2-image", "siglip2-text"]
+    p = dm.add_parser("knobs", help="what can be changed, per target")
+    p.add_argument("target", nargs="?", choices=dummy_targets)
+    p.set_defaults(func=cmd_dummy_knobs)
+    for name, helptext in (("plan", "resolve and check a request (no torch, no AI Hub): config, shapes, warnings"),
+                           ("run", "random checkpoint -> Qualcomm's export -> AI Hub compile/link/profile -> verify -> report")):
+        p = dm.add_parser(name, help=helptext)
+        p.add_argument("target", choices=dummy_targets)
+        p.add_argument("--dims", nargs="+", metavar="KNOB=N", help="e.g. layers=12 hidden=1024 heads=4 (see `dummy knobs`)")
+        p.add_argument("--base-config", help="the real model's config.json, checkpoint folder or HF id "
+                                             "(default: Qualcomm's cache, else Hugging Face)")
+        p.add_argument("--context-length", type=int, help="gemma4-text (default 4096)")
+        p.add_argument("--prompt-length", type=int, help="gemma4-text prompt graph (default 128)")
+        p.add_argument("--splits", nargs="+", type=int, help="gemma4-text layer split points (default: Qualcomm's rule)")
+        p.add_argument("--precision", help="gemma4-text w4a16 | w8a16 | fp16; SigLIP 2 float | w8a16 | w8a8 | w4a16")
+        p.add_argument("--batch", type=int, help="SigLIP 2 batch (default 1)")
+        if name == "run":
+            p.add_argument("--out", help="results folder (default $HEXPROF_DOWNLOAD_DIR/dummy/<target>__<knobs>); "
+                                         "re-running resumes")
+            p.add_argument("--device", default=DEFAULT_HUB_DEVICE)
+            p.add_argument("--qairt", help="QAIRT version (default: the one qai_hub_models pins)")
+            p.add_argument("--seed", type=int, default=0)
+            p.add_argument("--calibration-samples", type=int, help="random calibration samples for the quantize job")
+            p.add_argument("--no-hw", action="store_true", help="skip the QHAS / optrace downloads")
+            p.add_argument("--no-report", action="store_true", help="skip the hardware report")
+            p.add_argument("--compute-json")
+            p.add_argument("--bandwidth-json")
+            p.set_defaults(func=cmd_dummy_run)
+        else:
+            p.set_defaults(func=cmd_dummy_plan)
+    p = dm.add_parser("verify", help="re-check a dummy run against AI Hub")
+    p.add_argument("run_dir")
+    p.add_argument("--device")
+    p.set_defaults(func=cmd_dummy_verify)
 
     # ---- ceilings
     c = sub.add_parser("ceilings", help="measure NPU compute / bandwidth ceilings on AI Hub").add_subparsers(dest="sub", required=True)

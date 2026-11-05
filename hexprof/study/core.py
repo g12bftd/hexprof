@@ -20,7 +20,9 @@ AXES: dict[str, dict[str, list[str]]] = {
         "decode-tokens": ["1", "2", "4", "8"],
     },
     "gemma4-vision": {
-        "image-size": ["224", "336", "448", "560"],
+        # Gemma 4 resizes every image to fill this many soft tokens x pooling_kernel^2 patches: the token
+        # budget sets the graph; the input image size does not (any square image gives the same graph)
+        "soft-tokens": ["70", "140", "280", "560", "1120"],
         "precision": ["float", "w8a16"],
         "mixed-precision": ["0", "5", "10", "25", "50"],
         "qairt": ["qualcomm", "default", "latest"],
@@ -37,11 +39,62 @@ AXES: dict[str, dict[str, list[str]]] = {
         "mixed-precision": ["0", "5", "10", "25", "50"],
         "qairt": ["qualcomm", "default", "latest"],
     },
+    # shrunk models with random weights (hexprof dummy): one knob swept, the others fixed (--dims) or real
+    "dummy-gemma4-text": {
+        "layers": ["6", "12", "24", "42"],
+        "hidden": ["640", "1280", "1920", "2560"],
+        "intermediate": ["2560", "5120", "10240", "15360"],
+        "heads": ["2", "4", "8", "16"],
+        "kv-heads": ["1", "2", "4", "8"],
+        "head-dim": ["64", "128", "256"],
+        "global-head-dim": ["128", "256", "512"],
+        "sliding-window": ["128", "256", "512", "1024"],
+        "kv-shared-layers": ["0", "6", "12", "18"],
+        "ple-dim": ["64", "128", "256"],
+        "vocab": ["32768", "65536", "131072", "262144"],
+        "context-length": ["1024", "2048", "4096"],
+        "prompt-length": ["64", "128", "256"],
+        "precision": ["w4a16", "w8a16"],
+    },
+    "dummy-gemma4-vision": {
+        "layers": ["4", "8", "16"],
+        "hidden": ["384", "768", "1152"],
+        "intermediate": ["1536", "3072", "4608"],
+        "heads": ["6", "12"],
+        "soft-tokens": ["70", "140", "280", "560", "1120"],
+        "pooling-kernel": ["2", "3", "4"],
+        "text-hidden": ["1280", "2560"],
+    },
+    "dummy-siglip2-image": {
+        "layers": ["3", "6", "12"],
+        "hidden": ["384", "768", "1024"],
+        "intermediate": ["1536", "3072", "4096"],
+        "heads": ["6", "12", "16"],
+        "image-size": ["224", "256", "384", "512"],
+        "patch-size": ["14", "16", "32"],
+        "batch": ["1", "2", "4"],
+        "precision": ["float", "w8a16", "w8a8", "w4a16"],
+    },
+    "dummy-siglip2-text": {
+        "layers": ["3", "6", "12"],
+        "hidden": ["384", "768", "1024"],
+        "intermediate": ["1536", "3072", "4096"],
+        "heads": ["6", "12", "16"],
+        "vocab": ["32000", "64000", "256000"],
+        "seq-len": ["16", "32", "64", "128"],
+        "batch": ["1", "2", "4", "8"],
+        "precision": ["float", "w8a16", "w8a8", "w4a16"],
+    },
 }
-NUMERIC_AXES = {"context-length", "prompt-length", "decode-tokens", "image-size", "batch", "mixed-precision"}
+NUMERIC_AXES = {"context-length", "prompt-length", "decode-tokens", "soft-tokens", "batch", "mixed-precision",
+                # dummy knobs
+                "layers", "hidden", "intermediate", "heads", "kv-heads", "head-dim", "global-head-dim",
+                "sliding-window", "kv-shared-layers", "ple-dim", "vocab", "patch-size", "pooling-kernel",
+                "text-hidden", "image-size", "seq-len", "projection"}
+ZERO_OK = {"kv-shared-layers"}
 BASELINE = {  # Qualcomm's shipped setting per axis: the reference every study includes
     ("gemma4-text", "context-length"): "4096", ("gemma4-text", "prompt-length"): "128",
-    ("gemma4-text", "decode-tokens"): "1", ("gemma4-vision", "image-size"): "448",
+    ("gemma4-text", "decode-tokens"): "1", ("gemma4-vision", "soft-tokens"): "280",
     ("gemma4-vision", "precision"): "float", ("siglip2-image", "batch"): "1", ("siglip2-text", "batch"): "1",
     ("siglip2-image", "precision"): "w8a16", ("siglip2-text", "precision"): "w8a16",
     # qairt: "qualcomm" = the version qai_hub_models pins (what its exports use); default / latest = AI Hub tags
@@ -69,11 +122,11 @@ def validate(target: str, axis: str, values: Sequence[str]) -> list[str]:
         if bad:
             raise ValueError(f"mixed-precision takes the percentage of layers kept at higher precision, 0-99; got {bad}")
     elif axis in NUMERIC_AXES:
-        bad = [v for v in vals if not v.isdigit() or int(v) <= 0]
+        bad = [v for v in vals if not v.isdigit() or (int(v) <= 0 and axis not in ZERO_OK)]
         if bad:
             raise ValueError(f"{axis} takes positive integers; got {bad}")
-        if axis == "image-size" and any(int(v) % 112 for v in vals):
-            raise ValueError("image-size values must be multiples of 112 (whole patches for 14- or 16-px patches)")
+        if axis == "soft-tokens" and any(int(v) not in (70, 140, 280, 560, 1120) for v in vals):
+            raise ValueError("soft-tokens values must be Gemma 4 image-processor budgets: 70, 140, 280, 560, 1120")
     if axis == "precision":
         ok = {"float", "w8a16", "w8a8", "w4a16", "w4a8", "w16a16"}
         bad = [v for v in vals if v not in ok]
@@ -169,6 +222,16 @@ class Study:
                   + (f", {len(bad)} failed: " + "; ".join(f"{c['what']}: expected {c['expected']}, got {c['actual']}"
                                                          for c in bad[:3]) if bad else "") + ")"
                   + (f" {ver['error']}" if ver.get("error") else ""), flush=True)
+
+
+def kind(target: str) -> str:
+    """The deployment a target's results look like: 'gemma4-text' (split LLM parts) or 'component'."""
+    return "gemma4-text" if target.replace("dummy-", "") == "gemma4-text" else "component"
+
+
+def baseline_of(st: dict[str, Any]) -> str | None:
+    """The reference value of a study: Qualcomm's setting, or for a dummy the knob's unswept value."""
+    return st.get("baseline") or BASELINE.get((st.get("target"), st.get("axis")))
 
 
 def _sort_key(v: str) -> tuple[int, Any]:
