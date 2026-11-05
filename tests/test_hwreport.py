@@ -206,3 +206,27 @@ def test_report_end_to_end_rollup_units_and_published(tmp_path):
     trows = {r["metric"]: r for r in summ["blocks"][0]["table"]["rows"]}
     assert trows["Inference time"]["published"] == "3.319 ms" and trows["Warm load time"]["value"] == "120.000 ms"
     assert any(t["label"] == "AI Hub inference peak memory" for t in page["tiles"])
+
+
+def test_end_to_end_examples_from_the_parts():
+    from hexprof.hwreport import report as R
+
+    vis = R.Graph("vision_encoder__gemma_4_e4b_it")
+    vis.out = {"aihub": {"inference_time_ms": 972.061}}
+    vis.io = {"image_tokens_out": 256}
+    block = R.e2e_examples({"aihub_ms": 70.935, "cl": 4096}, {"aihub_ms": 138.303, "ar": 128}, [vis])
+    rows = {r["what"]: r for r in block["table"]["rows"]}
+    r = rows["1 image + question, 128-token answer"]
+    assert (r["prompt_tokens"], r["chunks"]) == (296, "3 × 128")  # 256 image + 40 text tokens -> 3 prefill chunks
+    assert abs(r["ttft_ms"] - (972.061 + 3 * 138.303)) < 1e-6
+    assert abs(r["total_s"] * 1e3 - (r["ttft_ms"] + 127 * 70.935)) < 1e-6
+    assert rows["text question, 128-token answer"]["vision_ms"] == 0.0
+
+
+def test_limiter_needs_a_measured_peak_to_be_reached():
+    from hexprof.hwreport.efficiency import limiter
+
+    assert limiter(0.5, 78.7) == "DRAM bandwidth"  # Gemma 4 decode: 0.5% of P, 79% of B
+    assert limiter(35.0, 39.2) == "neither roof"  # Gemma 4 prefill: below both roofs
+    assert limiter(70.0, 20.0) == "compute (P)"
+    assert limiter(None, None) is None

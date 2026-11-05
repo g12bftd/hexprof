@@ -40,7 +40,7 @@ B=${HEXPROF_DOWNLOAD_DIR}/runs/ceil-bandwidth/bandwidth_ceiling.json
 
 # your inference runs on real images and prompts (hexprof_vlm_infer.sbatch writes runs/<jobid>/{gemma4,siglip2})
 shopt -s nullglob
-GEMMA_REQ=("${HEXPROF_DOWNLOAD_DIR}"/runs/*/gemma4/results.json)
+GEMMA_REQ=("${HEXPROF_DOWNLOAD_DIR}"/runs/*/gemma4/results.json "${HEXPROF_DOWNLOAD_DIR}"/runs/gemma4-aihub-*/results.json)
 SIGLIP_REQ=("${HEXPROF_DOWNLOAD_DIR}"/runs/*/siglip2/results.json)
 shopt -u nullglob
 echo "Gemma 4 requests found: ${#GEMMA_REQ[@]}; SigLIP 2 requests found: ${#SIGLIP_REQ[@]}"

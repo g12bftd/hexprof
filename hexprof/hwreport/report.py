@@ -708,6 +708,54 @@ def requests_section(paths: Sequence[str | Path], graphs: list[Graph]) -> dict[s
                 {"key": "output", "label": "Output", "kind": "str"}], "rows": rows}}]}
 
 
+# Example requests for the end-to-end table: (what, image tokens?, text + chat-template tokens, output tokens).
+# Text + template is an assumption (Gemma's chat template adds about 15-20 tokens around a short question);
+# `hexprof gemma4 aihub --image ... --prompt ...` counts the real tokens of your own requests.
+E2E_EXAMPLES = [("text question, 128-token answer", False, 40, 128),
+                ("1 image + question, 128-token answer", True, 40, 128),
+                ("1 image + question, 512-token answer", True, 40, 512),
+                ("1 image + long prompt (500 tokens), 256-token answer", True, 500, 256)]
+
+
+def e2e_examples(tok: dict[str, Any], pre: dict[str, Any], vis: list[Graph]) -> dict[str, Any]:
+    """Time to first token and end to end for typical requests, from the profiled graphs."""
+    chunk, chunk_ms, step_ms, ctx = int(pre["ar"]), float(pre["aihub_ms"]), float(tok["aihub_ms"]), int(tok["cl"])
+    vg = vis[0] if vis else None
+    vis_ms = float(vg.out["aihub"]["inference_time_ms"]) if vg else None
+    img_tok = int((vg.io or {}).get("image_tokens_out") or 256) if vg else 256
+    rows = []
+    for what, image, text, out_tok in E2E_EXAMPLES:
+        if image and vis_ms is None:
+            continue
+        prompt = text + (img_tok if image else 0)
+        chunks = -(-prompt // chunk)
+        ttft = (vis_ms if image else 0.0) + chunks * chunk_ms
+        total = ttft + (out_tok - 1) * step_ms
+        rows.append({"what": what, "image_tokens": img_tok if image else 0, "text_tokens": text, "prompt_tokens": prompt,
+                     "chunks": f"{chunks} × {chunk}", "vision_ms": vis_ms if image else 0.0, "prefill_ms": chunks * chunk_ms,
+                     "ttft_ms": ttft, "output_tokens": out_tok, "decode_ms": (out_tok - 1) * step_ms, "total_s": total / 1e3,
+                     "fits": "yes" if prompt + out_tok <= ctx else f"no (> {ctx})"})
+    return {"type": "note", "text": (
+        f"Worked examples. Time to first token = vision encoder (one image: {img_tok} image tokens) + "
+        f"ceil(prompt tokens ÷ {chunk}) × {chunk_ms:.1f} ms (the prompt graphs run once per {chunk}-token chunk, padded); "
+        f"each further token = {step_ms:.1f} ms (one pass of the token graphs). The text + chat-template token counts are "
+        "assumptions; your own requests (`hexprof gemma4 aihub --image … --prompt …`, then this report with "
+        "--requests) are counted exactly."),
+        "table": {"open": True, "cols": [
+            {"key": "what", "label": "Request", "kind": "str"},
+            {"key": "image_tokens", "label": "Image tokens", "kind": "num"},
+            {"key": "text_tokens", "label": "Text + template tokens", "kind": "num"},
+            {"key": "prompt_tokens", "label": "Prompt tokens", "kind": "num"},
+            {"key": "chunks", "label": "Prefill chunks", "kind": "str"},
+            {"key": "vision_ms", "label": "Vision (ms)", "kind": "num"},
+            {"key": "prefill_ms", "label": "Prefill (ms)", "kind": "num"},
+            {"key": "ttft_ms", "label": "Time to first token (ms)", "kind": "num"},
+            {"key": "output_tokens", "label": "Output tokens", "kind": "num"},
+            {"key": "decode_ms", "label": "Decode (ms)", "kind": "num"},
+            {"key": "total_s", "label": "End to end (s)", "kind": "num"},
+            {"key": "fits", "label": f"Fits {ctx} context", "kind": "str"}], "rows": rows}}
+
+
 def deployment_section(paths: Sequence[str | Path]) -> dict[str, Any] | None:
     """What was deployed, from the run manifest(s) hexprof wrote next to the results (hexprof.runlog)."""
     found: list[dict[str, Any]] = []
@@ -868,6 +916,8 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
                      f"prefill {pub['prefill_tokens_per_second']:.0f} tok/s, time to first token from "
                      f"{pub['time_to_first_token_range_milliseconds']['min']:.0f} ms. Same ballpark expected, not equality.")
         blocks_e2e.append({"type": "note", "text": text})
+    if tok and pre and tok.get("aihub_ms") and pre.get("aihub_ms"):
+        blocks_e2e.append(e2e_examples(tok, pre, vis))
     sections: list[dict[str, Any]] = []
     io_rows = [{"label": short_label(g.label), **{k: v for k, v in (g.io or {}).items() if k not in ("inputs", "outputs")}}
                for g in graphs if g.io]
@@ -890,7 +940,9 @@ def overview_page(graphs: list[Graph], title: str, ctx: EF.Ctx | None = None,
         sections.insert(0, deployed_sec)
     if blocks_e2e:
         sections.append({"title": "End to end (from the parts)", "why": "Decode = 1 ÷ (sum of the token graphs); prefill = "
-                         "chunk length ÷ (sum of the prompt graphs).", "blocks": blocks_e2e})
+                         "chunk length ÷ (sum of the prompt graphs); time to first token = vision encoder + prefill "
+                         "chunks; end to end = time to first token + one decode step per further token.",
+                         "blocks": blocks_e2e})
     cols = [{"key": "label", "label": "Graph", "kind": "str", "link": "href"},
             {"key": "aihub_ms", "label": "AI Hub ms", "kind": "num"}]
     if any(r["published_ms"] for r in rows):

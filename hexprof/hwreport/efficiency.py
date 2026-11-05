@@ -39,6 +39,22 @@ class Ctx:
     ceilings_src: dict[str, str] = field(default_factory=dict)
 
 
+# A graph is limited by a resource when it reaches this share of the measured peak (P or B); below both
+# roofs, the time goes elsewhere (vector work, waits, overheads): see the critical path by unit.
+LIMIT_PCT = 60.0
+
+
+def limiter(compute_util_pct: float | None, bw_util_pct: float | None) -> str | None:
+    """Which measured peak a graph actually reaches (≥ LIMIT_PCT), if any."""
+    if bw_util_pct is not None and bw_util_pct >= LIMIT_PCT:
+        return "DRAM bandwidth"
+    if compute_util_pct is not None and compute_util_pct >= LIMIT_PCT:
+        return "compute (P)"
+    if compute_util_pct is not None or bw_util_pct is not None:
+        return "neither roof"
+    return None
+
+
 def precision_of(label: str, recorded: str | None, ctx: Ctx) -> str | None:
     if label in ctx.precisions:
         return ctx.precisions[label]
@@ -128,6 +144,9 @@ def graph_metrics(label: str, kpis: dict[str, Any], instances: dict[str, Any], q
                    bound="memory" if (not P or mem_roof < P) else "compute",
                    roof_basis=("measured P and B" if P and B else "measured P, theoretical B" if P else
                                "measured B only" if B else "theoretical B only"))
+    lim = limiter(out.get("compute_util_pct"), out.get("bw_util_pct"))
+    if lim:
+        out["limiter"] = lim  # "neither roof": the overview adds the unit that dominates the critical path
     if out.get("weight_bytes") and dram:
         expected = out["weight_bytes"] + out.get("kv_bytes", 0.0)
         out.update(expected_bytes=expected, beyond_bytes=dram - expected, dram_over_expected=dram / expected)
@@ -356,7 +375,14 @@ def overview_sections(graphs: list[Any], short_label: Any, ctx: Ctx) -> list[dic
         m = g.out.get("efficiency") or {}
         if not m:
             continue
+        bk = (g.out.get("qhas") or {}).get("by_kind") or {}
+        top = max(bk.items(), key=lambda kv: kv[1].get("dp_cycles") or 0, default=(None, {}))
+        tot_dp = sum(v.get("dp_cycles") or 0 for v in bk.values())
+        lim = m.get("limiter")
+        if lim == "neither roof" and top[0] and tot_dp:
+            lim = f"neither roof: {top[0]} {100 * (top[1].get('dp_cycles') or 0) / tot_dp:.0f}% of critical path"
         rows.append({"label": short_label(g.label), "precision": m.get("precision"), "macs": m.get("macs"),
+                     "limiter": lim,
                      "tops": m.get("achieved_tops"), "compute_util_pct": m.get("compute_util_pct"),
                      "gbps": m.get("dram_gbps"), "bw_util_pct": m.get("bw_util_pct"),
                      "bw_util_theory_pct": m.get("bw_util_theory_pct"), "intensity": m.get("intensity"),
@@ -384,7 +410,10 @@ def overview_sections(graphs: list[Any], short_label: Any, ctx: Ctx) -> list[dic
         "title": "Compute and memory efficiency, per graph",
         "why": "Utilization = achieved rate ÷ measured peak (P for compute at the graph's precision, B for DRAM "
                "bandwidth). Roofline: the attainable rate at a graph's arithmetic intensity is min(P, intensity × B); "
-               "points far below their roof have room to improve.",
+               "points far below their roof have room to improve. 'Roofline side' only says which roof is lower at "
+               f"that intensity; 'Limited by' says whether the graph actually reaches ≥ {LIMIT_PCT:.0f}% of P or B. "
+               "Below both, the run time goes to work the roofline does not count (vector ops, waits, overheads), "
+               "named by the unit that dominates the critical path.",
         "blocks": ([{"type": "note", "text": note}] if note else []) + (
             [{"type": "roofline", "points": pts, "groups": groups or ["unknown"],
               "P": {g: v for g, v in ctx.P.items() if g in groups}, "B": ctx.B,
@@ -395,21 +424,28 @@ def overview_sections(graphs: list[Any], short_label: Any, ctx: Ctx) -> list[dic
                 {"key": "compute_util_pct", "label": "% of P", "kind": "pct"}, {"key": "gbps", "label": "GB/s", "kind": "num"},
                 {"key": "bw_util_pct", "label": "% of B", "kind": "pct"},
                 {"key": "bw_util_theory_pct", "label": f"% of {ctx.theory_gbps:g}", "kind": "pct"},
-                {"key": "intensity", "label": "ops/byte", "kind": "num"}, {"key": "bound", "label": "Bound", "kind": "str"},
+                {"key": "limiter", "label": f"Limited by (≥ {LIMIT_PCT:.0f}% of a peak)", "kind": "str"},
+                {"key": "intensity", "label": "ops/byte", "kind": "num"},
+                {"key": "bound", "label": "Roofline side", "kind": "str"},
                 {"key": "roof_pct", "label": "% of roofline", "kind": "pct"},
                 {"key": "weights", "label": "Weights", "kind": "bytes"},
                 {"key": "dram_over_expected", "label": "DRAM ÷ (weights + KV)", "kind": "num"},
                 {"key": "macs_source", "label": "MACs from", "kind": "str"}], "rows": rows}}]}]
     wrows = [{"label": r["label"], "value": r["waiting"]} for r in srows if r["waiting"] is not None]
     secs.append({"title": "Stalls and parallelism, per graph",
-                 "why": "Idle = HTP not executing; waiting = cycles inside ops that are not active (Qualcomm's % active "
-                        "cycles); DMA wait, sync, data movement and graph I/O as shares of the critical path; average "
-                        "busy threads = op cycles ÷ timeline cycles. Hardware stall counters are not exposed by AI Hub.",
+                 "why": "Idle = HTP not executing (the hardware view: low idle means the NPU is busy all the run). "
+                        "Waiting = per-thread view: cycles inside ops in which the op's thread was not active "
+                        "(Qualcomm's % active cycles). Several HTP threads share the vector and matrix units, so a thread "
+                        "often waits while another uses them: high waiting with low idle is not lost NPU time by itself. "
+                        "Time actually lost to memory is DMA wait on the critical path. DMA wait, sync, data movement "
+                        "and graph I/O are shares of the critical path; average busy threads = op cycles ÷ timeline "
+                        "cycles. Hardware stall counters are not exposed by AI Hub.",
                  "blocks": ([{"type": "hbar", "rows": wrows, "kind": "pct", "max": 100,
-                              "title": "share of op cycles waiting"}] if wrows else []) + [
+                              "title": "share of op cycles in which the op's thread waited (per-thread view)"}]
+                            if wrows else []) + [
                      {"type": "note", "text": "", "table": {"open": True, "cols": [
                          {"key": "label", "label": "Graph", "kind": "str"}, {"key": "idle", "label": "Idle %", "kind": "pct"},
-                         {"key": "waiting", "label": "Waiting %", "kind": "pct"},
+                         {"key": "waiting", "label": "Waiting in ops (per thread) %", "kind": "pct"},
                          {"key": "dma_crit", "label": "DMA wait (crit.)", "kind": "pct"},
                          {"key": "sync_crit", "label": "Sync (crit.)", "kind": "pct"},
                          {"key": "move_crit", "label": "Data movement (crit.)", "kind": "pct"},
