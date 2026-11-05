@@ -610,7 +610,13 @@ that what ran is what was asked:
   makes the compile fail rather than fall back, but the check reads it back anyway. This check also applies
   to the studies of the real models;
 * the job chain (uploaded part → quantized → compiled → linked → profiled), quantize dtypes, device, QAIRT;
-* for vision / SigLIP 2: the config Qualcomm's wrapper actually built, and the image-processor budget.
+* for vision / SigLIP 2: the config Qualcomm's wrapper actually built, and the image-processor budget;
+* Gemma 4 vision only: the dummy's compile, link and profile options against your real export's
+  vision-encoder jobs on AI Hub (`$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export`, or `--reference`). They must be
+  identical: same QAIRT version, same flags, same graph name (`gemma_4_e4b_it_vision_encoder`, as Qualcomm's
+  collection export names it). The compiled input shapes must also match when the patch geometry is unchanged.
+  Images are prepared by Gemma 4's own image processor (Google's preprocessor config, no tokenizer needed),
+  or by transformers' class defaults if the Hub is unreachable (same shapes and patch positions).
 
 Finally the hardware report is built (per-op MACs from the local ONNX parts). Sweep one knob with
 verification and a comparison page:

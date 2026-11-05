@@ -411,6 +411,7 @@ STUDY_FIXED = {  # fixed setting -> (targets it applies to, the axis it would co
     "calibration_samples": (_COMPONENTS | DUMMY_TARGETS, None),
     "override": (_COMPONENTS, None),
     "dims": (DUMMY_TARGETS, None), "base_config": (DUMMY_TARGETS, None), "seed": (DUMMY_TARGETS, None),
+    "reference": ({"dummy-gemma4-vision"}, None),
     "splits": ({"dummy-gemma4-text"}, None),
 }
 
@@ -517,7 +518,8 @@ def cmd_dummy_run(args: argparse.Namespace) -> int:
     dc, db = default_ceilings()  # the measured ceilings (slurm/ceilings.sh) when they exist
     ver = DR.run(args.target, dims, _dummy_deploy(args), out, args.device, base=args.base_config, seed=args.seed,
                  qairt=args.qairt, hw=not args.no_hw, report=not args.no_report, n_calib=args.calibration_samples,
-                 compute_json=args.compute_json or dc, bandwidth_json=args.bandwidth_json or db)
+                 compute_json=args.compute_json or dc, bandwidth_json=args.bandwidth_json or db,
+                 reference=args.reference)
     print(f"results: {out}")
     return 0 if ver.get("ok") else 1
 
@@ -525,7 +527,7 @@ def cmd_dummy_run(args: argparse.Namespace) -> int:
 def cmd_dummy_verify(args: argparse.Namespace) -> int:
     from hexprof.dummy import run as DR
 
-    return 0 if DR.verify(args.run_dir, args.device).get("ok") else 1
+    return 0 if DR.verify(args.run_dir, args.device, args.reference).get("ok") else 1
 
 
 def cmd_hub_frameworks(args: argparse.Namespace) -> int:
@@ -849,6 +851,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--base-config", help="the real model's config.json (default: Qualcomm's cache, else Hugging Face)")
     g.add_argument("--seed", type=int, help="random-weight seed (default 0)")
     g.add_argument("--splits", nargs="+", type=int, help="dummy-gemma4-text: layer split points (default: Qualcomm's rule)")
+    g.add_argument("--reference", help="dummy-gemma4-vision: Qualcomm export to compare job options with "
+                                       "(default: $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export when present)")
     p.set_defaults(func=cmd_study_run)
     p = st.add_parser("verify", help="re-check every profiled value of a study against AI Hub")
     p.add_argument("study_dir")
@@ -891,6 +895,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--calibration-samples", type=int, help="random calibration samples for the quantize job")
             p.add_argument("--no-hw", action="store_true", help="skip the QHAS / optrace downloads")
             p.add_argument("--no-report", action="store_true", help="skip the hardware report")
+            p.add_argument("--reference", help="gemma4-vision: Qualcomm export whose vision-encoder jobs the dummy's "
+                                               "compile / link / profile options must equal (default: "
+                                               "$HEXPROF_DOWNLOAD_DIR/gemma4-s25-export when present)")
             p.add_argument("--compute-json")
             p.add_argument("--bandwidth-json")
             p.set_defaults(func=cmd_dummy_run)
@@ -899,6 +906,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = dm.add_parser("verify", help="re-check a dummy run against AI Hub")
     p.add_argument("run_dir")
     p.add_argument("--device")
+    p.add_argument("--reference", help="Qualcomm export to compare the vision encoder's job options with")
     p.set_defaults(func=cmd_dummy_verify)
 
     # ---- ceilings

@@ -59,7 +59,8 @@ def run_one(target: str, axis: str, value: str, vdir: Path, fixed: dict[str, Any
 
     dims, deploy = request(target, axis, value, fixed)
     ver = R.run(base(target), dims, deploy, vdir, device, base=fixed.get("base_config"), seed=int(fixed.get("seed") or 0),
-                qairt=fixed.get("qairt"), hw=True, report=False, n_calib=fixed.get("calibration_samples"))
+                qairt=fixed.get("qairt"), hw=True, report=False, n_calib=fixed.get("calibration_samples"),
+                reference=fixed.get("reference"))
     return {"dims": dims, "deploy": deploy, "verified_at_run": ver.get("ok")}
 
 

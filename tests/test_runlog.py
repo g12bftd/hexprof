@@ -69,6 +69,26 @@ def test_run_logs_model_settings_hardware_and_every_job(tmp_path, monkeypatch, c
     assert mod.submit_compile_job.__name__ == "<lambda>"  # unwrapped again after the run
 
 
+def test_capture_keeps_signatures(tmp_path, monkeypatch):
+    """hexprof.aihub.client.submit_inference inspects submit_inference_job for ``profile=``."""
+    import inspect
+
+    import hexprof.aihub.client as hc
+
+    mod = _fake_qai_hub(monkeypatch)
+    calls = []
+
+    def submit_inference_job(model, device, inputs=None, name="", options="", profile=False):
+        calls.append(profile)
+        return _Job("ji", name)
+
+    mod.submit_inference_job = submit_inference_job
+    with runlog.run(tmp_path, kind="t", title="t", model={"name": "m", "weights": "w"}):
+        assert "profile" in inspect.signature(mod.submit_inference_job).parameters
+        hc.submit_inference(SimpleNamespace(model_id="m1"), "dev", {"x": [1]}, profile=True)
+    assert calls == [True]
+
+
 def test_nested_run_in_the_same_folder_adds_details_and_failure_is_recorded(tmp_path, monkeypatch):
     _fake_qai_hub(monkeypatch)
     with pytest.raises(RuntimeError):

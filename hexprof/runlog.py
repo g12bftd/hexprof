@@ -32,6 +32,7 @@ stops a deployment: logging problems are reported and ignored.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import platform
@@ -367,6 +368,7 @@ def _capture(run: Run) -> Iterator[None]:
              "submit_link_job": "link", "submit_profile_job": "profile", "submit_inference_job": "inference"}
 
     def wrap(name: str, fn: Any) -> Any:
+        @functools.wraps(fn)  # keep the signature: hexprof.aihub.client inspects it (e.g. ``profile=``)
         def wrapped(*a: Any, **kw: Any) -> Any:
             res = fn(*a, **kw)
             kind = kinds[name]

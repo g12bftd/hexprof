@@ -97,7 +97,8 @@ def component_fixed(r: S.Resolved, ckpt: Path, qairt: str | None, n_calib: int |
 
 def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Path, device: str,
         base: str | None = None, seed: int = 0, qairt: str | None = None, hw: bool = True, report: bool = True,
-        n_calib: int | None = None, compute_json: str | None = None, bandwidth_json: str | None = None) -> dict[str, Any]:
+        n_calib: int | None = None, compute_json: str | None = None, bandwidth_json: str | None = None,
+        reference: str | None = None) -> dict[str, Any]:
     from hexprof.dummy import checkpoint as C
 
     out = Path(out)
@@ -119,7 +120,8 @@ def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Pa
         rl.add(model={"parameters": f"{info.get('parameters', 0) / 1e6:.1f} M in the checkpoint"})
         write_json(out / "dummy_run.json", {"target": target, "resolved": r.to_json(), "base_config": src, "seed": seed,
                                             "checkpoint": str(ckpt), "parameters": info.get("parameters"),
-                                            "qairt": qairt, "device": device, "expected": S.expected_io(r),
+                                            "qairt": qairt, "device": device, "reference": reference,
+                                            "expected": S.expected_io(r),
                                             "param_estimate": S.param_estimate(r)})
         if target == "gemma4-text":
             from hexprof.dummy import gemma4_text as G
@@ -134,7 +136,7 @@ def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Pa
 
             fixed = component_fixed(r, ckpt, qairt, n_calib)
             SC.run_one(target, "dummy", "-", out, fixed, device)
-            ver = verify_component(out, device)
+            ver = verify_component(out, device, reference)
         write_json(out / "verification.json", ver)
         _print_verification(ver)
         bad = [c["what"] for c in ver.get("checks", []) if not c["ok"]]
@@ -152,7 +154,7 @@ def run(target: str, dims: dict[str, int], deploy: dict[str, Any], out: str | Pa
     return ver
 
 
-def verify(out: str | Path, device: str | None = None) -> dict[str, Any]:
+def verify(out: str | Path, device: str | None = None, reference: str | None = None) -> dict[str, Any]:
     out = Path(out)
     meta = read_json(out / "dummy_run.json")
     dev = device or meta.get("device")
@@ -161,7 +163,7 @@ def verify(out: str | Path, device: str | None = None) -> dict[str, Any]:
 
         ver = G.verify(out, dev)
     else:
-        ver = verify_component(out, dev)
+        ver = verify_component(out, dev, reference or meta.get("reference"))
     write_json(out / "verification.json", ver)
     _print_verification(ver)
     return ver
@@ -171,7 +173,10 @@ def _same(a: list[int] | None, b: list[int] | None) -> bool:
     return a is not None and b is not None and sorted(a) == sorted(b)
 
 
-def verify_component(out: Path, device: str) -> dict[str, Any]:
+R_COMPONENT = {"gemma4-vision": "vision_encoder"}  # components with a Qualcomm export to compare against
+
+
+def verify_component(out: Path, device: str, reference: str | Path | None = None) -> dict[str, Any]:
     """The component runner's checks (job chain, device, precision, QAIRT) + the requested dimensions."""
     from hexprof.aihub import client as hc
     from hexprof.study import components as SC
@@ -205,11 +210,30 @@ def verify_component(out: Path, device: str) -> dict[str, Any]:
         if knob in d and key in got:
             g = got[key][0] if isinstance(got[key], list) else got[key]
             core.check(checks, f"Qualcomm's wrapper built {knob}", d[knob], g, int(g) == int(d[knob]))
+    notes: list[str] = []
     if t == "gemma4-vision":
         proc = var.get("processor") or {}
         core.check(checks, "image processor token budget", dep.get("soft_tokens"), proc.get("max_soft_tokens"),
                    proc.get("max_soft_tokens") == dep.get("soft_tokens"))
-    return core.summarize(checks, qairt=base.get("qairt"), dims=d, deploy=dep)
+        notes.append(f"image processor: {proc.get('image_processor_source')}")
+    if t in R_COMPONENT:
+        from hexprof.dummy import reference as REF
+
+        ref_dir = reference or REF.default_reference()
+        if ref_dir is None:
+            notes.append("no Qualcomm export to compare with (run slurm/gemma4_profile.sh, or pass --reference)")
+        else:
+            ref = REF.reference_jobs(ref_dir, R_COMPONENT[t])
+            if ref is None:
+                notes.append(f"{ref_dir} has no {R_COMPONENT[t]} profile job to compare with")
+            elif dep.get("precision") != S.DEPLOY[t]["precision"] or meta.get("qairt"):
+                notes.append("precision or QAIRT changed on purpose: options not compared with Qualcomm's export")
+            else:
+                geometry = all(d.get(k) == (r.get("real") or {}).get(k) for k in ("patch-size", "pooling-kernel", "soft-tokens"))
+                mine = {"compile": hc.get_job(jobs["compile_job"]), "link": hc.get_job(jobs["link_job"]) if jobs.get("link_job") else None,
+                        "profile": hc.get_job(jobs["profile_job"])}
+                REF.compare(checks, mine, ref, ref_dir, same_inputs=geometry)
+    return core.summarize(checks, qairt=base.get("qairt"), dims=d, deploy=dep, notes=notes)
 
 
 def _print_verification(ver: dict[str, Any]) -> None:
@@ -218,3 +242,5 @@ def _print_verification(ver: dict[str, Any]) -> None:
           + (f", {len(bad)} failed" if bad else "") + ")", flush=True)
     for c in bad[:12]:
         print(f"  FAILED {c['what']}: expected {c['expected']}, got {c['actual']}")
+    for n in ver.get("notes") or []:
+        print(f"  note: {n}")

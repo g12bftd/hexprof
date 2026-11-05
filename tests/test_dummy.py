@@ -241,3 +241,33 @@ def test_analytic_counts_follow_a_dummy_checkpoint(tmp_path):
     assert c.splits == tuple(r.deploy["splits"]) and c.uniform_bits == 8
     head = ge.part_counts(c, 4, 4, 1, 1024)
     assert head["layers"] == "lm_head" and head["params"] == 256 * 4096
+
+
+def test_reference_comparison_needs_identical_options(tmp_path, monkeypatch):
+    """A dummy's compile / link / profile options against the real export's jobs (hexprof.dummy.reference)."""
+    from hexprof.dummy import reference as REF
+    from tests.dummyhub import Job, Model
+
+    monkeypatch.setattr("hexprof.aihub.client.qairt_version", lambda job: "2.50.0")
+    opts = {"compile": "--target_runtime qnn_dlc --qairt_version 2.50 --qnn_options context_enable_graphs=g",
+            "link": "--qairt_version 2.50", "profile": "--qairt_version 2.50 --qnn_options context_enable_graphs=g"}
+
+    def chain(changed: str | None = None) -> dict:
+        o = {k: v + (" --extra" if k == changed else "") for k, v in opts.items()}
+        c = Job("c", "compile", options=o["compile"], shapes={"pixel_values": ((1, 2520, 768), "float32")})
+        lk = Job("l", "link", options=o["link"], models=[Model("m", {}, producer=c)])
+        return {"compile": c, "link": lk, "profile": Job("p", "profile", options=o["profile"],
+                                                        model=Model("b", {}, producer=lk))}
+
+    jobs = {"p_ref": chain()["profile"]}
+    monkeypatch.setattr("hexprof.aihub.client.get_job", lambda jid: jobs[jid])
+    (tmp_path / "export_profiles.json").write_text(json.dumps(
+        {"parts": {"vision_encoder/x": {"component": "vision_encoder", "graph": "x", "job": {"job_id": "p_ref"}}}}))
+    ref = REF.reference_jobs(tmp_path, "vision_encoder")
+    assert set(ref) >= {"profile", "link", "compile"}
+    ok: list = []
+    REF.compare(ok, chain(), ref, tmp_path, same_inputs=True)
+    assert ok and all(c["ok"] for c in ok)
+    bad: list = []
+    REF.compare(bad, chain("compile"), ref, tmp_path, same_inputs=True)
+    assert [c["what"].split(" =")[0] for c in bad if not c["ok"]] == ["compile options"]

@@ -31,14 +31,26 @@ class _ImageOnlyProcessor:
         return self.image_processor(images=images, return_tensors="pt")
 
 
-def _image_processor(src: Any, **overrides: Any) -> Any:
+GEMMA_REPO = "google/gemma-4-E4B-it"
+
+
+def _image_processor(src: Any, used: dict[str, Any] | None = None, **overrides: Any) -> Any:
+    """Gemma 4's own image processor (its settings from the checkpoint, else from Google's repo; it needs
+    no tokenizer), else transformers' Gemma4ImageProcessor with its defaults."""
     from transformers import AutoImageProcessor
 
-    try:
-        ip = AutoImageProcessor.from_pretrained(src) if src else None
-    except Exception:  # noqa: BLE001 - random checkpoints have no preprocessor config
-        ip = None
+    ip = None
+    for cand in filter(None, (src, GEMMA_REPO)):
+        try:
+            ip = AutoImageProcessor.from_pretrained(cand)
+            if used is not None:
+                used["image_processor_source"] = str(cand)
+            break
+        except Exception:  # noqa: BLE001 - random checkpoints have no preprocessor config; the Hub may be unreachable
+            continue
     if ip is None:
+        if used is not None:
+            used["image_processor_source"] = "transformers Gemma4ImageProcessor defaults (Gemma 4's own config unreachable)"
         try:
             from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor as IP
         except ImportError:  # pragma: no cover - older transformers
@@ -72,7 +84,7 @@ def gemma_processor(max_soft_tokens: int | None = None, patch_size: int | None =
             except Exception:  # noqa: BLE001
                 proc = None
         if proc is None:
-            proc = _ImageOnlyProcessor(_image_processor(src, **over))
+            proc = _ImageOnlyProcessor(_image_processor(src, used, **over))
         else:
             for k, v in over.items():
                 if v is not None:
