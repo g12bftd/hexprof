@@ -250,3 +250,24 @@ def test_graphs_table_links_each_graph_to_its_workbench_job(tmp_path):
     assert any(c["key"] == "job" and c.get("link") == "job_url" for c in table["cols"])
     row = table["rows"][0]
     assert row["job_url"] == f"https://workbench.aihub.qualcomm.com/jobs/{row['job']}/"
+
+
+def test_perfetto_copy_has_timestamps_in_microseconds(tmp_path):
+    import gzip
+    import json
+
+    from hexprof.hwreport import perfetto
+    from hexprof.hwreport import qhas as QH
+
+    root = hwfakes.gemma_export_layout(tmp_path / "exp", parts=1)  # optrace in HTP cycles, like AI Hub's
+    out = perfetto.export([root], tmp_path / "pf", compress=True)
+    assert len(out) == 2
+    for f in out:
+        doc = json.loads(gzip.open(f, "rt").read())
+        xs = [e for e in doc["traceEvents"] if e.get("ph") == "X"]
+        span_us = max(e["ts"] + e["dur"] for e in xs) - min(e["ts"] for e in xs)
+        label = f.name.split(".perfetto")[0]
+        q = next((root / "hw" / label / "qhas").glob("*.json"))
+        t_us = QH.overall_kpis(QH.load_overall(q))["time_us"]
+        assert abs(span_us / t_us - 1) < 0.01  # the trace now lasts as long as the QHAS run, in µs
+        assert {e["ph"] for e in doc["traceEvents"]} >= {"M", "X", "C"} and "note" in doc["otherData"]

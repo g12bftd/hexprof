@@ -384,6 +384,13 @@ def cmd_hw_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_hw_perfetto(args: argparse.Namespace) -> int:
+    from hexprof.hwreport import perfetto
+
+    perfetto.export(args.paths, args.out, compress=args.gzip)
+    return 0
+
+
 def cmd_hw_fetch_models(args: argparse.Namespace) -> int:
     from hexprof.hwreport import models
 
@@ -775,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("files", nargs="+")
     p.add_argument("--max-chars", type=int, default=20000)
     p.set_defaults(func=cmd_hw_fields)
+    p = w.add_parser("perfetto", help="Perfetto-ready copies of the optrace files (timestamps converted to µs)")
+    p.add_argument("paths", nargs="+", help="result folders (e.g. gemma4-s25-export) or optrace files")
+    p.add_argument("--out", help="output folder (default: <first path>/perfetto)")
+    p.add_argument("--gzip", action="store_true", help="write .json.gz (smaller downloads)")
+    p.set_defaults(func=cmd_hw_perfetto)
     p = w.add_parser("report", help="HTML report (charts + tables + CSV) from QHAS / optrace / AI Hub profile files")
     p.add_argument("paths", nargs="*", help="folders or files to scan (default: the Gemma 4 export dir)")
     p.add_argument("--out", help="output folder (default: <first path>/hw_report)")

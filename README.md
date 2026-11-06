@@ -384,6 +384,24 @@ are labelled as derived:
 The "% utilization" Qualcomm reports is the share of the run the HTP was busy, not compute or bandwidth
 efficiency; for those, see `hexprof gemma4 efficiency` and the ceilings.
 
+### Perfetto
+
+AI Hub's optrace files are Chrome-trace JSON, which [Perfetto](https://ui.perfetto.dev) opens directly. Their
+timestamps are HTP clock cycles (about 2000 per µs), though, and Perfetto reads them as µs, so every op would look
+about 2000× longer. `hexprof hw perfetto` writes copies with the timestamps converted to µs, calibrated against the
+same graph's QHAS run as in the report. It also renumbers process and thread ids, because Perfetto merges id 0
+and "thread id = process id" lanes; names, nesting and counters are unchanged.
+
+```bash
+hexprof hw perfetto $HEXPROF_DOWNLOAD_DIR/gemma4-s25-export --gzip
+```
+
+This writes `<folder>/perfetto/<graph>.perfetto.json.gz`, one per profiled graph. Open it at ui.perfetto.dev: the UI
+processes the trace locally in the browser. Its SQL tab, or the `perfetto` Python package's `TraceProcessor`,
+gives per-op queries such as `select name, count(*), sum(dur) from slice group by name order by 3 desc`. Perfetto
+shows the HTP op timeline the hardware report summarises. It cannot trace the hosted phone itself: AI Hub gives no
+system-level access, and Android system traces would not show the NPU's ops anyway.
+
 ### Per-op bound classification
 
 ```bash
