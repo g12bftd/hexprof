@@ -18,7 +18,8 @@ would need 4 chained cloud jobs per token, so it is not done here. Instead:
    * the same processor call gives N, the exact number of prompt tokens
      (text + image soft tokens) the compiled model would prefill;
    * stage times: vision encoder (measured on your image), prefill =
-     ceil(N/128) x the 4 prefill graphs, decode = M x the 4 decode graphs.
+     ceil(N/128) x the 4 prefill graphs (the last chunk's scores give the first output
+     token), decode = (M - 1) x the 4 decode graphs (one pass per further token).
      This is NPU graph time; host-side work (embedding lookup, sampling) is not
      included.
 3. Optionally, the **answer text** is generated on this computer by llama.cpp
@@ -229,7 +230,10 @@ def estimate(parts: dict[str, Any], prompt_tokens: int, gen_tokens: int, vision_
     chunks = math.ceil(prompt_tokens / seq)
     vis = vision_ms if vision_ms is not None else (_ms(parts["vision"]) if parts["vision"] else 0.0)
     prefill_ms = chunks * prefill_chunk_ms
-    decode_ms = gen_tokens * decode_token_ms
+    # the first output token comes from the last prefill chunk's scores; each further token is one pass of
+    # the decode graphs, so M output tokens take M - 1 decode passes
+    passes = max(int(gen_tokens) - 1, 0)
+    decode_ms = passes * decode_token_ms
     return {
         "vision_encoder_ms": vis,
         "prefill_tokens": prompt_tokens,
@@ -238,6 +242,7 @@ def estimate(parts: dict[str, Any], prompt_tokens: int, gen_tokens: int, vision_
         "prefill_ms": prefill_ms,
         "prefill_tps": prompt_tokens / (prefill_ms / 1e3) if prefill_ms else None,
         "decode_tokens": gen_tokens,
+        "decode_passes": passes,
         "decode_ms_per_token": decode_token_ms,
         "decode_ms": decode_ms,
         "decode_tps": 1e3 / decode_token_ms if decode_token_ms else None,
@@ -350,8 +355,8 @@ def markdown_report(r: dict[str, Any]) -> str:
             ["Vision encoder (your image, measured)", b["vision_encoder_ms"], "-", "-"],
             [f"Prefill ({b['prefill_chunks']} x {b['prefill_chunk_tokens']}-token graph)", b["prefill_ms"],
              f"{b['prefill_tokens']} (N)", b["prefill_tps"]],
-            [f"Decode ({b['decode_ms_per_token']:.2f} ms/token)", b["decode_ms"],
-             f"{b['decode_tokens']} (M, {b['decode_tokens_source']})", b["decode_tps"]],
+            [f"Decode ({b['decode_ms_per_token']:.2f} ms per pass, {b.get('decode_passes', b['decode_tokens'])} passes)",
+             b["decode_ms"], f"{b['decode_tokens']} output tokens (M, {b['decode_tokens_source']})", b["decode_tps"]],
             ["Time to first token", b["ttft_ms"], "-", "-"],
             ["End to end", b["e2e_ms"], "-", "-"],
         ]

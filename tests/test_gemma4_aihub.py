@@ -102,7 +102,9 @@ def test_aihub_infer_with_local_answer(tmp_path, setup_env):
     assert b["decode_ms_per_token"] == pytest.approx(4 * DECODE_MS)
     assert b["decode_tokens"] == 11 and b["decode_tokens_source"] == "local answer"
     assert b["vision_encoder_ms"] == pytest.approx(VISION_MS)
-    assert b["e2e_ms"] == pytest.approx(VISION_MS + b["prefill_ms"] + 11 * 4 * DECODE_MS)
+    # 11 output tokens: the first from the last prefill chunk, then 10 decode passes
+    assert b["decode_passes"] == 10
+    assert b["e2e_ms"] == pytest.approx(VISION_MS + b["prefill_ms"] + 10 * 4 * DECODE_MS)
     md = (tmp_path / "out" / "results.md").read_text()
     assert "New York Times" in md and "Vision encoder (your image, measured)" in md
 
